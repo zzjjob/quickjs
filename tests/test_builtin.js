@@ -987,6 +987,55 @@ function test_regexp()
     assert(/[a-z]bcdef/.exec("0000000"), null);
     assert("xbcdef ybcdef".replace(/[a-z]bcdef/g, "X"), "X X");
 
+    /* generic candidate scanning outside the backtracking stack */
+    a = /(a|ab)c/.exec("xxabc");
+    assert(a[0], "abc");
+    assert(a[1], "ab");
+    assert(a.index, 2);
+    a = /(a)?b/.exec("aaab");
+    assert(a[0], "ab");
+    assert(a[1], "a");
+    assert(a.index, 2);
+    assert(/(?=(ab))ab/.exec("xxab"), ["ab", "ab"]);
+    assert(/(?<=a)b/.exec("zzab").index, 3);
+    assert(/$/.exec("abc").index, 3);
+    assert(/^b/m.exec("a\nb").index, 2);
+    assert(/\u{1f431}/u.exec("x🐱").index, 1);
+    assert("ab12 cd34".replace(/([a-z]+)([0-9]+)/g, "$2:$1"),
+           "12:ab 34:cd");
+
+    /* bounded leading alternation candidate filtering */
+    a = /(^|[^\\])"x"/.exec('00"x"');
+    assert(a[0], '0"x"');
+    assert(a[1], "0");
+    assert(a.index, 1);
+    assert(/(^|[^\\])"x"/.exec('\\"x"'), null);
+    a = /(^|[^\\])"x"/.exec('"x"');
+    assert(a[0], '"x"');
+    assert(a.index, 0);
+    a = /(^|[^\\])"x"/.exec('Ω"x"');
+    assert(a[0], 'Ω"x"');
+    assert(a.index, 0);
+    assert('00"x" \\"x"'.replace(/(^|[^\\])"x"/g, "X"),
+           "0X \\\"x\"");
+    assert(/(^|[^\\])"x"/m.exec('\n"x"').index, 0);
+    a = /(?:^|.)abcd/.exec("abcXzabcd");
+    assert(a[0], "zabcd");
+    assert(a.index, 4);
+    assert(/(^|x)abc/.exec("00xabc").index, 2);
+    assert(/(^|\s)abc/.exec("00 abc").index, 2);
+    assert(/(^|x)abc/i.exec("00XABC").index, 2);
+    re = /(^|x)abc/y;
+    re.lastIndex = 2;
+    assert(re.exec("00xabc")[0], "xabc");
+
+    re = /(a|ab)c/y;
+    re.lastIndex = 2;
+    a = re.exec("xxabc");
+    assert(a[0], "abc");
+    assert(a[1], "ab");
+    assert(re.lastIndex, 5);
+
     seed = 0x12345678;
     for (i = 0; i < 200; i++) {
         s = "";

@@ -536,6 +536,128 @@ static int re_append_quick_check_metadata(REParseState *s, int re_flags)
     return dbuf_error(&s->byte_code) ? -1 : 1;
 }
 
+static BOOL re_single_char_opcode_end(const uint8_t *code, size_t code_len,
+                                      size_t pos, size_t *pend)
+{
+    size_t len;
+    int n, opcode;
+
+    if (pos >= code_len)
+        return FALSE;
+    opcode = code[pos];
+    switch(opcode) {
+    case REOP_char:
+    case REOP_char32:
+    case REOP_dot:
+    case REOP_any:
+    case REOP_space:
+    case REOP_not_space:
+        len = reopcode_info[opcode].size;
+        break;
+    case REOP_range:
+        if (pos + 3 > code_len)
+            return FALSE;
+        n = get_u16(code + pos + 1);
+        if (n == 0 || (size_t)n > (code_len - pos - 3) / 4)
+            return FALSE;
+        len = 3 + (size_t)n * 4;
+        break;
+    case REOP_range32:
+        if (pos + 3 > code_len)
+            return FALSE;
+        n = get_u16(code + pos + 1);
+        if (n == 0 || (size_t)n > (code_len - pos - 3) / 8)
+            return FALSE;
+        len = 3 + (size_t)n * 8;
+        break;
+    default:
+        return FALSE;
+    }
+    if (len > code_len - pos)
+        return FALSE;
+    *pend = pos + len;
+    return TRUE;
+}
+
+/* Detect (^|X)c where X consumes exactly one character. A match can only
+   start at the beginning of the input or immediately before c. */
+static BOOL re_get_leading_char_filter(const uint8_t *bc_buf,
+                                       size_t bc_buf_len, int re_flags,
+                                       uint32_t *chars, int *pchar_count)
+{
+    const uint8_t *code;
+    size_t pos, branch1, branch2, branch2_end, join;
+    int capture_index, char_count, opcode;
+    uint32_t c;
+
+    if (re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_MULTILINE |
+                    LRE_FLAG_STICKY | LRE_FLAG_UNICODE |
+                    LRE_FLAG_UNICODE_SETS))
+        return FALSE;
+    if (bc_buf_len < RE_HEADER_LEN + 20)
+        return FALSE;
+    code = bc_buf + RE_HEADER_LEN;
+    bc_buf_len -= RE_HEADER_LEN;
+    if (code[0] != REOP_split_goto_first || get_i32(code + 1) != 6 ||
+        code[5] != REOP_any || code[6] != REOP_goto ||
+        get_i32(code + 7) != -11 || code[11] != REOP_save_start ||
+        code[12] != 0)
+        return FALSE;
+
+    pos = 13;
+    capture_index = -1;
+    if (pos + 2 <= bc_buf_len && code[pos] == REOP_save_start) {
+        capture_index = code[pos + 1];
+        pos += 2;
+    }
+    if (pos + 5 > bc_buf_len ||
+        (code[pos] != REOP_split_goto_first &&
+         code[pos] != REOP_split_next_first))
+        return FALSE;
+    branch1 = pos + 5;
+    branch2 = branch1 + get_i32(code + pos + 1);
+    if (branch2 <= branch1 || branch2 >= bc_buf_len ||
+        code[branch1] != REOP_line_start ||
+        branch1 + 6 > bc_buf_len || code[branch1 + 1] != REOP_goto)
+        return FALSE;
+    join = branch1 + 6 + get_i32(code + branch1 + 2);
+    if (join > bc_buf_len ||
+        !re_single_char_opcode_end(code, bc_buf_len, branch2, &branch2_end) ||
+        branch2_end != join)
+        return FALSE;
+    pos = join;
+    if (capture_index >= 0) {
+        if (pos + 2 > bc_buf_len || code[pos] != REOP_save_end ||
+            code[pos + 1] != capture_index)
+            return FALSE;
+        pos += 2;
+    }
+    char_count = 0;
+    while (pos < bc_buf_len && char_count < 4) {
+        opcode = code[pos];
+        if (opcode == REOP_char) {
+            if (pos + 3 > bc_buf_len)
+                return FALSE;
+            c = get_u16(code + pos + 1);
+            pos += 3;
+        } else if (opcode == REOP_char32) {
+            if (pos + 5 > bc_buf_len)
+                return FALSE;
+            c = get_u32(code + pos + 1);
+            if (c > 0xffff)
+                return FALSE;
+            pos += 5;
+        } else {
+            break;
+        }
+        chars[char_count++] = c;
+    }
+    if (char_count == 0)
+        return FALSE;
+    *pchar_count = char_count;
+    return TRUE;
+}
+
 static int lre_parse_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
                               LREMetadata *meta, const uint8_t **ptrailer)
 {
@@ -3218,7 +3340,7 @@ typedef struct {
 
     StackElem *stack_buf;
     size_t stack_size;
-    StackElem static_stack_buf[32]; /* static stack to avoid allocation in most cases */
+    StackElem static_stack_buf[128]; /* static stack to avoid allocation in most cases */
 } REExecContext;
 
 static int lre_poll_timeout(REExecContext *s)
@@ -3336,8 +3458,13 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
         no_match:
             for(;;) {
                 REExecStateEnum type;
-                if (bp == s->stack_buf)
+                if (bp == s->stack_buf) {
+                    while (sp > bp) {
+                        capture[sp[-2].val] = sp[-1].ptr;
+                        sp -= 2;
+                    }
                     return 0;
+                }
                 /* undo the modifications to capture[] */
                 while (sp > bp) {
                     capture[sp[-2].val] = sp[-1].ptr;
@@ -3804,6 +3931,75 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     }
 }
 
+static const uint8_t *lre_find_leading_char_candidate(REExecContext *s,
+                                                       const uint8_t *cptr,
+                                                       const uint32_t *chars,
+                                                       int char_count,
+                                                       int *pret)
+{
+    int i;
+
+    if (cptr >= s->cbuf_end)
+        return NULL;
+    if (cptr == s->cbuf) {
+        const uint8_t *p = cptr;
+
+        for(i = 0; i < char_count; i++) {
+            uint32_t c;
+
+            if (p >= s->cbuf_end)
+                break;
+            GET_CHAR(c, p, s->cbuf_end, s->cbuf_type);
+            if (c != chars[i])
+                break;
+        }
+        if (i == char_count)
+            return cptr;
+    }
+    if (s->cbuf_type == 0) {
+        const uint8_t *p, *search;
+
+        for(i = 0; i < char_count; i++) {
+            if (chars[i] > 0xff)
+                return NULL;
+        }
+        search = cptr + 1;
+        while (s->cbuf_end - search >= char_count) {
+            p = memchr(search, chars[0],
+                       s->cbuf_end - search - char_count + 1);
+            if (!p)
+                return NULL;
+            for(i = 1; i < char_count; i++) {
+                if (p[i] != chars[i])
+                    break;
+            }
+            if (i == char_count)
+                return p - 1;
+            search = p + 1;
+        }
+        return NULL;
+    } else {
+        const uint16_t *p = (const uint16_t *)cptr + 1;
+        const uint16_t *end = (const uint16_t *)s->cbuf_end;
+        int count = 0;
+
+        while (end - p >= char_count) {
+            for(i = 0; i < char_count; i++) {
+                if (p[i] != chars[i])
+                    break;
+            }
+            if (i == char_count)
+                return (const uint8_t *)(p - 1);
+            p++;
+            if ((++count & 1023) == 0 && lre_poll_timeout(s)) {
+                *pret = LRE_RET_TIMEOUT;
+                return NULL;
+            }
+        }
+        return NULL;
+    }
+}
+
 /* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
    starting position of the match and must be such as 0 <= cindex <=
    clen. */
@@ -3814,7 +4010,10 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
 {
     REExecContext s_s, *s = &s_s;
     int re_flags, i, ret;
-    const uint8_t *cptr;
+    uint32_t c, bytecode_len, filter_chars[4];
+    const uint8_t *cptr, *pc;
+    int filter_char_count;
+    BOOL scan_candidates, filter_candidates;
 
     re_flags = lre_get_flags(bc_buf);
     s->is_unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
@@ -3830,9 +4029,6 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
     s->stack_buf = s->static_stack_buf;
     s->stack_size = countof(s->static_stack_buf);
 
-    for(i = 0; i < s->capture_count * 2; i++)
-        capture[i] = NULL;
-
     cptr = cbuf + (cindex << cbuf_type);
     if (0 < cindex && cindex < clen && s->cbuf_type == 2) {
         const uint16_t *p = (const uint16_t *)cptr;
@@ -3841,8 +4037,37 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
         }
     }
 
-    ret = lre_exec_backtrack(s, capture,
-                             bc_buf + RE_HEADER_LEN + bytecode_offset, cptr);
+    bytecode_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+    pc = bc_buf + RE_HEADER_LEN + bytecode_offset;
+    scan_candidates = bytecode_offset == 0 && bytecode_len >= 13 &&
+        pc[0] == REOP_split_goto_first && get_i32(pc + 1) == 6 &&
+        pc[5] == REOP_any && pc[6] == REOP_goto &&
+        get_i32(pc + 7) == -11 && pc[11] == REOP_save_start && pc[12] == 0;
+    if (scan_candidates)
+        pc += 11;
+    filter_candidates = scan_candidates &&
+        re_get_leading_char_filter(bc_buf, RE_HEADER_LEN + bytecode_len,
+                                   re_flags, filter_chars, &filter_char_count);
+
+    for(i = 0; i < s->capture_count * 2; i++)
+        capture[i] = NULL;
+    ret = 0;
+    for(;;) {
+        if (filter_candidates) {
+            cptr = lre_find_leading_char_candidate(s, cptr, filter_chars,
+                                                    filter_char_count, &ret);
+            if (!cptr)
+                break;
+        }
+        ret = lre_exec_backtrack(s, capture, pc, cptr);
+        if (ret != 0 || !scan_candidates || cptr >= s->cbuf_end)
+            break;
+        GET_CHAR(c, cptr, s->cbuf_end, s->cbuf_type);
+        if (lre_poll_timeout(s)) {
+            ret = LRE_RET_TIMEOUT;
+            break;
+        }
+    }
 
     if (s->stack_buf != s->static_stack_buf)
         lre_realloc(s->opaque, s->stack_buf, 0);
