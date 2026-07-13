@@ -3,6 +3,7 @@ set -eu
 
 QJS="${QJS:-./qjs}"
 QJSC="${QJSC:-./qjsc}"
+QBC_REGEXP_MUTATOR="${QBC_REGEXP_MUTATOR:-./tests/qbc_regexp_mutator}"
 TMP_DIR="${TMPDIR:-/tmp}/quickjs-bytecode-file-test-$$"
 
 cleanup() {
@@ -78,3 +79,65 @@ if ! grep -q 'checksum mismatch' "$TMP_DIR/bad-checksum.err"; then
     cat "$TMP_DIR/bad-checksum.err" >&2
     exit 1
 fi
+
+cat > "$TMP_DIR/regexp-validation.js" <<'EOF'
+var results = [
+    /abc/.exec("zabc")[0],
+    /(abc)/.exec("zabc")[1],
+    /a.c/.exec("za-c")[0],
+    /abcdef[0-9]+/.exec("zabcdef1")[0],
+    /[a-z]bcdef/.exec("zxbcdef")[0],
+];
+console.log(results.join(","));
+console.log("regexp qbc validation sentinel");
+EOF
+
+"$QJSC" -s --bytecode -o "$TMP_DIR/regexp-validation.qbc" \
+    "$TMP_DIR/regexp-validation.js"
+cat > "$TMP_DIR/regexp-function-validation.js" <<'EOF'
+console.log(/abc/.test("abc"));
+EOF
+"$QJSC" -s --bytecode -o "$TMP_DIR/regexp-function-validation.qbc" \
+    "$TMP_DIR/regexp-function-validation.js"
+
+"$QBC_REGEXP_MUTATOR" "$TMP_DIR/regexp-validation.qbc" \
+    "$TMP_DIR/regexp-clear-atom.qbc" clear-atom
+"$QJS" --bytecode "$TMP_DIR/regexp-clear-atom.qbc" \
+    > "$TMP_DIR/regexp-clear-atom.out"
+if ! grep -q '^abc,abc,a-c,abcdef1,xbcdef$' "$TMP_DIR/regexp-clear-atom.out"; then
+    echo "qjs rejected or misexecuted a safe missing ATOM marker" >&2
+    cat "$TMP_DIR/regexp-clear-atom.out" >&2
+    exit 1
+fi
+
+for mode in forge-atom-capture forge-atom-nonliteral bad-regexp-opcode \
+    bad-metadata-version bad-prefix-entry bad-quick-check \
+    bad-function-opcode; do
+    mutation_input="$TMP_DIR/regexp-validation.qbc"
+    if [ "$mode" = bad-function-opcode ]; then
+        mutation_input="$TMP_DIR/regexp-function-validation.qbc"
+    fi
+    "$QBC_REGEXP_MUTATOR" "$mutation_input" \
+        "$TMP_DIR/$mode.qbc" "$mode"
+    status=0
+    "$QJS" --bytecode "$TMP_DIR/$mode.qbc" \
+        > "$TMP_DIR/$mode.out" 2> "$TMP_DIR/$mode.err" || status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "qjs accepted malformed bytecode mode: $mode" >&2
+        exit 1
+    fi
+    if [ "$status" -ge 128 ]; then
+        echo "qjs crashed on malformed bytecode mode: $mode" >&2
+        cat "$TMP_DIR/$mode.err" >&2
+        exit 1
+    fi
+    if grep -q 'regexp qbc validation sentinel' "$TMP_DIR/$mode.out"; then
+        echo "qjs evaluated malformed bytecode mode: $mode" >&2
+        exit 1
+    fi
+    if ! grep -Eq 'invalid (regexp|function)' "$TMP_DIR/$mode.err"; then
+        echo "missing validation diagnostic for mode: $mode" >&2
+        cat "$TMP_DIR/$mode.err" >&2
+        exit 1
+    fi
+done
