@@ -364,12 +364,20 @@ $(OBJDIR)/%.check.o: %.c | $(OBJDIR)
 regexp_test: libregexp.c libunicode.c cutils.c
 	$(CC) $(LDFLAGS) $(CFLAGS) -DTEST -o $@ libregexp.c libunicode.c cutils.c $(LIBS)
 
+tests/test_regexp_bytecode$(EXE): tests/test_regexp_bytecode.c libregexp.c libunicode.c cutils.c
+	$(CC) $(LDFLAGS) $(CFLAGS) -I. -o $@ tests/test_regexp_bytecode.c libregexp.c libunicode.c cutils.c $(LIBS)
+
+tests/qbc_regexp_mutator$(EXE): tests/qbc_regexp_mutator.c libregexp.c libunicode.c cutils.c
+	$(CC) $(LDFLAGS) $(CFLAGS) -I. -o $@ tests/qbc_regexp_mutator.c libregexp.c libunicode.c cutils.c $(LIBS)
+
 unicode_gen: $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o libunicode.c unicode_gen_def.h
 	$(HOST_CC) $(LDFLAGS) $(CFLAGS) -o $@ $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o
 
 clean:
 	rm -f repl.c out.c
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
+	rm -f tests/test_regexp_bytecode$(EXE)
+	rm -f tests/qbc_regexp_mutator$(EXE)
 	rm -f hello.c test_fib.c
 	rm -f examples/*.so tests/*.so tests/*.qbc examples/*.qbc
 	rm -rf $(OBJDIR)/ *.dSYM/ qjs-debug$(EXE)
@@ -454,7 +462,8 @@ ifdef CONFIG_SHARED_LIBS
 test: tests/bjson.so examples/point.so
 endif
 
-test: qjs$(EXE) qjsc$(EXE)
+test: qjs$(EXE) qjsc$(EXE) tests/test_regexp_bytecode$(EXE) tests/qbc_regexp_mutator$(EXE)
+	$(WINE) ./tests/test_regexp_bytecode$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_closure.js
 	$(WINE) ./qjsc$(EXE) --bytecode -o tests/test_closure.qbc tests/test_closure.js
 	$(WINE) ./qjs$(EXE) --bytecode tests/test_closure.qbc
