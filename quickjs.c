@@ -37503,7 +37503,7 @@ typedef enum BCTagEnum {
     BC_TAG_OBJECT_REFERENCE,
 } BCTagEnum;
 
-#define BC_VERSION 6
+#define BC_VERSION 8
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -38780,7 +38780,7 @@ static int js_validate_regexp_constant(JSContext *ctx, JSFunctionBytecode *b,
         return -1;
     }
 
-    /* Older payloads may omit the optional ATOM optimization marker. */
+    /* Serialized payloads may omit the optional ATOM optimization marker. */
     if (!(serialized_flags & LRE_FLAG_ATOM)) {
         put_u16(trusted_bytecode,
                 lre_get_flags(trusted_bytecode) & ~LRE_FLAG_ATOM);
@@ -47946,6 +47946,22 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
     return ret;
 }
 
+/* The caller transfers its existing pattern and bytecode references to re.
+   metadata is a borrowed view and must always be derived from bytecode. */
+static void js_regexp_set_compiled_data(JSRegExp *re, JSString *pattern,
+                                        JSString *bytecode)
+{
+    LREMetadata metadata;
+
+    re->pattern = pattern;
+    re->bytecode = bytecode;
+    re->metadata = NULL;
+    if (!bytecode->is_wide_char &&
+        lre_get_metadata(bytecode->u.str8, bytecode->len, &metadata) == 1) {
+        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
+    }
+}
+
 /* fast regexp creation */
 static JSValue JS_NewRegexp(JSContext *ctx, JSValue pattern, JSValue bc)
 {
@@ -47953,7 +47969,6 @@ static JSValue JS_NewRegexp(JSContext *ctx, JSValue pattern, JSValue bc)
     JSProperty props[1];
     JSObject *p;
     JSRegExp *re;
-    LREMetadata metadata;
 
     /* sanity check */
     if (unlikely(JS_VALUE_GET_TAG(bc) != JS_TAG_STRING ||
@@ -47967,14 +47982,8 @@ static JSValue JS_NewRegexp(JSContext *ctx, JSValue pattern, JSValue bc)
         goto fail;
     p = JS_VALUE_GET_OBJ(obj);
     re = &p->u.regexp;
-    re->pattern = JS_VALUE_GET_STRING(pattern);
-    re->bytecode = JS_VALUE_GET_STRING(bc);
-    if (!re->bytecode->is_wide_char &&
-        lre_get_metadata(re->bytecode->u.str8, re->bytecode->len,
-                         &metadata) == 1)
-        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
-    else
-        re->metadata = NULL;
+    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                               JS_VALUE_GET_STRING(bc));
     return obj;
  fail:
     JS_FreeValue(ctx, bc);
@@ -47989,7 +47998,6 @@ static JSValue js_regexp_set_internal(JSContext *ctx,
 {
     JSObject *p;
     JSRegExp *re;
-    LREMetadata metadata;
 
     /* sanity check */
     if (unlikely(JS_VALUE_GET_TAG(bc) != JS_TAG_STRING ||
@@ -48003,14 +48011,8 @@ static JSValue js_regexp_set_internal(JSContext *ctx,
 
     p = JS_VALUE_GET_OBJ(obj);
     re = &p->u.regexp;
-    re->pattern = JS_VALUE_GET_STRING(pattern);
-    re->bytecode = JS_VALUE_GET_STRING(bc);
-    if (!re->bytecode->is_wide_char &&
-        lre_get_metadata(re->bytecode->u.str8, re->bytecode->len,
-                         &metadata) == 1)
-        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
-    else
-        re->metadata = NULL;
+    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                               JS_VALUE_GET_STRING(bc));
     /* Note: cannot fail because the field is preallocated */
     JS_DefinePropertyValue(ctx, obj, JS_ATOM_lastIndex, JS_NewInt32(ctx, 0),
                            JS_PROP_WRITABLE);
@@ -48160,8 +48162,8 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
     }
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
     JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, re->bytecode));
-    re->pattern = JS_VALUE_GET_STRING(pattern);
-    re->bytecode = JS_VALUE_GET_STRING(bc);
+    js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                               JS_VALUE_GET_STRING(bc));
     if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
                        JS_NewInt32(ctx, 0)) < 0)
         return JS_EXCEPTION;
@@ -48425,7 +48427,15 @@ static force_inline int js_regexp_set_lastIndex(JSContext *ctx, JSValueConst thi
     return 0;
 }
 
+#ifndef JS_REGEXP_CAPTURE_STACK_SIZE
 #define JS_REGEXP_CAPTURE_STACK_SIZE 16
+#endif
+#if JS_REGEXP_CAPTURE_STACK_SIZE < 2 || JS_REGEXP_CAPTURE_STACK_SIZE > 512
+#error "JS_REGEXP_CAPTURE_STACK_SIZE must be between 2 and 512"
+#endif
+/* The default capture array uses 64 bytes on 32-bit and 128 bytes on
+   64-bit targets. Larger expressions fall back to the runtime allocator. */
+#define JS_REGEXP_SCAN_CHUNK_SIZE 65536
 
 static force_inline const uint8_t *
 js_regexp_get_atom(int re_flags, int capture_count, const JSRegExp *re)
@@ -48508,38 +48518,127 @@ static force_inline BOOL js_regexp_atom_starts_at(JSString *str, int start,
     return TRUE;
 }
 
-static force_inline int js_regexp_match_atom(uint8_t **capture, JSString *str,
+static force_inline int js_regexp_indexof_char_range(JSString *str, int c,
+                                                     int from, int to)
+{
+    int i;
+
+    if (str->is_wide_char) {
+        if (c > 0xffff)
+            return -1;
+        for(i = from; i < to; i++) {
+            if (str->u.str16[i] == c)
+                return i;
+        }
+    } else if ((c & ~0xff) == 0) {
+        const uint8_t *p = memchr(str->u.str8 + from, c, to - from);
+
+        if (p)
+            return p - str->u.str8;
+    }
+    return -1;
+}
+
+static int js_regexp_find_source_atom(JSContext *ctx, JSString *str,
+                                      JSString *pattern, int start_index,
+                                      int *pstart)
+{
+    int c, candidate, chunk_end, limit;
+
+    if (pattern->len > str->len) {
+        *pstart = -1;
+        return 0;
+    }
+    limit = str->len - pattern->len + 1;
+    c = string_get(pattern, 0);
+    while (start_index < limit) {
+        chunk_end = start_index +
+            min_int(limit - start_index, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (start_index < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, start_index,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_source_starts_at(str, candidate, pattern)) {
+                *pstart = candidate;
+                return 0;
+            }
+            start_index = candidate + 1;
+        }
+        start_index = chunk_end;
+        if (start_index < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    *pstart = -1;
+    return 0;
+}
+
+static int js_regexp_find_decoded_atom(JSContext *ctx, JSString *str,
+                                       const uint8_t *atom, int start_index,
+                                       int *pstart)
+{
+    int c, candidate, chunk_end, len, limit;
+
+    len = get_u32(atom + LRE_META_LENGTH_OFFSET);
+    if (len > str->len) {
+        *pstart = -1;
+        return 0;
+    }
+    limit = str->len - len + 1;
+    c = js_regexp_atom_char(atom, 0);
+    while (start_index < limit) {
+        chunk_end = start_index +
+            min_int(limit - start_index, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (start_index < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, start_index,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_atom_starts_at(str, candidate, atom)) {
+                *pstart = candidate;
+                return 0;
+            }
+            start_index = candidate + 1;
+        }
+        start_index = chunk_end;
+        if (start_index < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
+    }
+    *pstart = -1;
+    return 0;
+}
+
+static force_inline int js_regexp_match_atom(JSContext *ctx,
+                                             uint8_t **capture, JSString *str,
                                              const uint8_t *atom,
                                              JSString *pattern,
                                              int start_index)
 {
-    int c, i, start, shift, len;
+    int ret, start, shift, len;
 
     if (atom[LRE_META_FLAGS_OFFSET] & LRE_META_FLAG_SOURCE) {
         len = pattern->len;
-        if (start_index + pattern->len <= str->len &&
+        if (len <= str->len - start_index &&
             js_regexp_source_starts_at(str, start_index, pattern)) {
             start = start_index;
+            ret = 0;
         } else {
-            start = string_indexof(str, pattern, start_index);
+            ret = js_regexp_find_source_atom(ctx, str, pattern,
+                                             start_index + 1, &start);
         }
-    } else if (js_regexp_atom_starts_at(str, start_index, atom)) {
-        len = get_u32(atom + LRE_META_LENGTH_OFFSET);
-        start = start_index;
     } else {
         len = get_u32(atom + LRE_META_LENGTH_OFFSET);
-        start = -1;
-        c = js_regexp_atom_char(atom, 0);
-        for(i = start_index; i + len <= str->len; i = start + 1) {
-            start = string_indexof_char(str, c, i);
-            if (start < 0 || start + len > str->len) {
-                start = -1;
-                break;
-            }
-            if (js_regexp_atom_starts_at(str, start, atom))
-                break;
+        if (len <= str->len - start_index &&
+            js_regexp_atom_starts_at(str, start_index, atom)) {
+            start = start_index;
+            ret = 0;
+        } else {
+            ret = js_regexp_find_decoded_atom(ctx, str, atom,
+                                              start_index + 1, &start);
         }
     }
+    if (ret < 0)
+        return ret;
     if (start < 0)
         return 0;
     shift = str->is_wide_char;
@@ -48553,28 +48652,35 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
                                   const uint8_t *prefix, JSString *str,
                                   int start_index)
 {
-    int c, candidate, i, ret, attempts, len, shift;
+    int c, candidate, chunk_end, ret, len, limit, shift;
 
     len = get_u32(prefix + LRE_META_LENGTH_OFFSET);
     shift = str->is_wide_char;
     c = js_regexp_atom_char(prefix, 0);
     candidate = start_index;
-    attempts = 0;
-    while (candidate + len <= str->len) {
-        candidate = string_indexof_char(str, c, candidate);
-        if (candidate < 0 || candidate + len > str->len)
-            return 0;
-        if (js_regexp_atom_starts_at(str, candidate, prefix)) {
-            ret = lre_exec_at(capture, re_bytecode,
-                              get_u32(prefix + LRE_META_ENTRY_OFFSET),
-                              str->u.str8, candidate, str->len, shift, ctx);
-            if (ret != 0)
-                return ret;
-            if ((++attempts & 1023) == 0 && lre_check_timeout(ctx))
-                return LRE_RET_TIMEOUT;
+    if (len > str->len)
+        return 0;
+    limit = str->len - len + 1;
+    while (candidate < limit) {
+        chunk_end = candidate +
+            min_int(limit - candidate, JS_REGEXP_SCAN_CHUNK_SIZE);
+        while (candidate < chunk_end) {
+            candidate = js_regexp_indexof_char_range(str, c, candidate,
+                                                     chunk_end);
+            if (candidate < 0)
+                break;
+            if (js_regexp_atom_starts_at(str, candidate, prefix)) {
+                ret = lre_exec_at(capture, re_bytecode,
+                                  get_u32(prefix + LRE_META_ENTRY_OFFSET),
+                                  str->u.str8, candidate, str->len, shift, ctx);
+                if (ret != 0)
+                    return ret;
+            }
+            candidate++;
         }
-        i = candidate + 1;
-        candidate = i;
+        candidate = chunk_end;
+        if (candidate < limit && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
     }
     return 0;
 }
@@ -48619,6 +48725,48 @@ static int js_regexp_match_quick_check(JSContext *ctx, uint8_t **capture,
     return 0;
 }
 
+typedef struct JSRegExpExecData {
+    const uint8_t *bytecode;
+    const uint8_t *atom;
+    const uint8_t *prefix;
+    const uint8_t *quick_check;
+    int re_flags;
+    BOOL is_atom;
+} JSRegExpExecData;
+
+static force_inline void
+js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re,
+                         int capture_count)
+{
+    d->bytecode = re->bytecode->u.str8;
+    d->re_flags = lre_get_flags(d->bytecode);
+    d->atom = js_regexp_get_atom(d->re_flags, capture_count, re);
+    d->is_atom = d->atom != NULL;
+    d->prefix = d->is_atom ? NULL : js_regexp_get_prefix(re);
+    d->quick_check = (d->is_atom || d->prefix) ? NULL :
+        js_regexp_get_quick_check(re);
+}
+
+static force_inline int
+js_regexp_match(JSContext *ctx, uint8_t **capture,
+                const JSRegExpExecData *d, JSRegExp *re,
+                JSString *str, int start_index)
+{
+    if (d->is_atom) {
+        return js_regexp_match_atom(ctx, capture, str, d->atom, re->pattern,
+                                    start_index);
+    } else if (d->prefix) {
+        return js_regexp_match_prefix(ctx, capture, d->bytecode, d->prefix,
+                                      str, start_index);
+    } else if (d->quick_check) {
+        return js_regexp_match_quick_check(ctx, capture, d->bytecode,
+                                           d->quick_check, str, start_index);
+    } else {
+        return lre_exec(capture, d->bytecode, str->u.str8, start_index,
+                        str->len, str->is_wide_char, ctx);
+    }
+}
+
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -48634,8 +48782,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     const char *group_name_ptr;
     JSObject *p_obj;
     JSAtom group_name;
-    BOOL is_atom;
-    const uint8_t *atom, *prefix, *quick_check;
+    JSRegExpExecData exec_data;
     
     if (!re)
         return JS_EXCEPTION;
@@ -48668,26 +48815,13 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
             goto fail;
     }
     capture_count = lre_get_capture_count(re_bytecode);
-    atom = js_regexp_get_atom(re_flags, capture_count, re);
-    is_atom = (atom != NULL);
-    prefix = is_atom ? NULL : js_regexp_get_prefix(re);
-    quick_check = (is_atom || prefix) ? NULL : js_regexp_get_quick_check(re);
+    js_regexp_exec_data_init(&exec_data, re, capture_count);
     shift = str->is_wide_char;
     str_buf = str->u.str8;
     if (last_index > str->len) {
         rc = 2;
-    } else if (is_atom) {
-        rc = js_regexp_match_atom(capture, str, atom, re->pattern, last_index);
-    } else if (prefix) {
-        rc = js_regexp_match_prefix(ctx, capture, re_bytecode, prefix, str,
-                                    last_index);
-    } else if (quick_check) {
-        rc = js_regexp_match_quick_check(ctx, capture, re_bytecode,
-                                         quick_check, str, last_index);
     } else {
-        rc = lre_exec(capture, re_bytecode,
-                      str_buf, last_index, str->len,
-                      shift, ctx);
+        rc = js_regexp_match(ctx, capture, &exec_data, re, str, last_index);
     }
     if (rc != 1) {
         if (rc >= 0) {
@@ -48713,7 +48847,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                 goto fail;
         }
         prop_flags = JS_PROP_C_W_E | JS_PROP_THROW;
-        if (is_atom && !(re_flags & LRE_FLAG_INDICES)) {
+        if (exec_data.is_atom && !(re_flags & LRE_FLAG_INDICES)) {
             JSValue val;
             int start;
 
@@ -48734,11 +48868,13 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
             if (!p_obj->u.array.u.values)
                 goto fail;
             p_obj->u.array.u1.size = 1;
-            if (atom[LRE_META_FLAGS_OFFSET] & LRE_META_FLAG_SOURCE) {
+            if (exec_data.atom[LRE_META_FLAGS_OFFSET] &
+                LRE_META_FLAG_SOURCE) {
                 val = JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, re->pattern));
             } else {
                 val = js_sub_string(ctx, str, start,
-                                    start + get_u32(atom + LRE_META_LENGTH_OFFSET));
+                                    start + get_u32(exec_data.atom +
+                                                    LRE_META_LENGTH_OFFSET));
                 if (JS_IsException(val))
                     goto fail;
             }
@@ -48905,8 +49041,8 @@ static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val, JSValueC
     StringBuffer b_s, *b = &b_s;
     JSString *rp = JS_VALUE_GET_STRING(rep_val);
     const char *group_name_ptr;
-    BOOL fullUnicode, has_match, simple_replace, is_atom;
-    const uint8_t *atom, *prefix, *quick_check;
+    BOOL fullUnicode, has_match, simple_replace;
+    JSRegExpExecData exec_data;
     
     if (!re)
         return JS_EXCEPTION;
@@ -48941,10 +49077,7 @@ static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val, JSValueC
             goto fail;
     }
     capture_count = lre_get_capture_count(re_bytecode);
-    atom = js_regexp_get_atom(re_flags, capture_count, re);
-    is_atom = (atom != NULL);
-    prefix = is_atom ? NULL : js_regexp_get_prefix(re);
-    quick_check = (is_atom || prefix) ? NULL : js_regexp_get_quick_check(re);
+    js_regexp_exec_data_init(&exec_data, re, capture_count);
     fullUnicode = ((re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0);
     shift = str->is_wide_char;
     str_buf = str->u.str8;
@@ -48954,18 +49087,9 @@ static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val, JSValueC
     for (;;) {
         if (last_index > str->len) {
             ret = 0;
-        } else if (is_atom) {
-            ret = js_regexp_match_atom(capture, str, atom, re->pattern,
-                                       last_index);
-        } else if (prefix) {
-            ret = js_regexp_match_prefix(ctx, capture, re_bytecode, prefix,
-                                         str, last_index);
-        } else if (quick_check) {
-            ret = js_regexp_match_quick_check(ctx, capture, re_bytecode,
-                                              quick_check, str, last_index);
         } else {
-            ret = lre_exec(capture, re_bytecode,
-                           str_buf, last_index, str->len, shift, ctx);
+            ret = js_regexp_match(ctx, capture, &exec_data, re, str,
+                                  last_index);
         }
         if (ret != 1) {
             if (ret >= 0) {

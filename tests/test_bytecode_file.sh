@@ -83,10 +83,12 @@ fi
 cat > "$TMP_DIR/regexp-validation.js" <<'EOF'
 var results = [
     /abc/.exec("zabc")[0],
+    /\x61bc/.exec("zabc")[0],
     /(abc)/.exec("zabc")[1],
     /a.c/.exec("za-c")[0],
     /abcdef[0-9]+/.exec("zabcdef1")[0],
     /[a-z]bcdef/.exec("zxbcdef")[0],
+    /(^|[^\\])"x"/.exec('00"x"')[0],
 ];
 console.log(results.join(","));
 console.log("regexp qbc validation sentinel");
@@ -104,15 +106,15 @@ EOF
     "$TMP_DIR/regexp-clear-atom.qbc" clear-atom
 "$QJS" --bytecode "$TMP_DIR/regexp-clear-atom.qbc" \
     > "$TMP_DIR/regexp-clear-atom.out"
-if ! grep -q '^abc,abc,a-c,abcdef1,xbcdef$' "$TMP_DIR/regexp-clear-atom.out"; then
+if ! grep -q '^abc,abc,abc,a-c,abcdef1,xbcdef,0"x"$' "$TMP_DIR/regexp-clear-atom.out"; then
     echo "qjs rejected or misexecuted a safe missing ATOM marker" >&2
     cat "$TMP_DIR/regexp-clear-atom.out" >&2
     exit 1
 fi
 
 for mode in forge-atom-capture forge-atom-nonliteral bad-regexp-opcode \
-    bad-metadata-version bad-prefix-entry bad-quick-check \
-    bad-function-opcode; do
+    bad-metadata-version bad-source-payload bad-scan-entry \
+    bad-leading-char bad-prefix-entry bad-quick-check bad-function-opcode; do
     mutation_input="$TMP_DIR/regexp-validation.qbc"
     if [ "$mode" = bad-function-opcode ]; then
         mutation_input="$TMP_DIR/regexp-function-validation.qbc"
@@ -141,3 +143,17 @@ for mode in forge-atom-capture forge-atom-nonliteral bad-regexp-opcode \
         exit 1
     fi
 done
+
+"$QBC_REGEXP_MUTATOR" "$TMP_DIR/regexp-validation.qbc" \
+    "$TMP_DIR/old-bytecode-version.qbc" old-bytecode-version
+if "$QJS" --bytecode "$TMP_DIR/old-bytecode-version.qbc" \
+    > "$TMP_DIR/old-bytecode-version.out" \
+    2> "$TMP_DIR/old-bytecode-version.err"; then
+    echo "qjs accepted a prior bytecode version" >&2
+    exit 1
+fi
+if ! grep -q 'invalid version' "$TMP_DIR/old-bytecode-version.err"; then
+    echo "missing prior bytecode version diagnostic" >&2
+    cat "$TMP_DIR/old-bytecode-version.err" >&2
+    exit 1
+fi
