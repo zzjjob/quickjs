@@ -49,7 +49,9 @@ typedef enum {
 #define TEST_RE_META_PAYLOAD_SIZE_OFFSET 4
 #define TEST_RE_META_LENGTH_OFFSET 8
 #define TEST_RE_META_ENTRY_OFFSET 12
-#define TEST_RE_META_HEADER_LEN 16
+#define TEST_RE_META_EXEC_FLAGS_OFFSET 16
+#define TEST_RE_META_LEADING_COUNT_OFFSET 20
+#define TEST_RE_META_HEADER_LEN 24
 
 int lre_check_stack_overflow(void *opaque, size_t alloca_size)
 {
@@ -282,8 +284,14 @@ static void test_literal_metadata(void)
     assert(lre_get_metadata(buf, len, &meta) == 1);
     assert(meta.kind == LRE_META_LITERAL && meta.encoding == 0);
     assert(meta.flags == LRE_META_FLAG_SOURCE);
-    assert(meta.length == 3 && meta.payload_size == 3);
-    assert(memcmp(meta.payload, "abc", 3) == 0);
+    assert(meta.length == 3 && meta.payload_size == 0);
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_PAYLOAD_SIZE_OFFSET, 1);
+    expect_invalid(copy, len);
+    free(copy);
+    expect_invalid(buf, meta_pos + TEST_RE_META_HEADER_LEN - 1);
     free(buf);
 
     buf = compile_regexp("\\x61bc", 0, &len);
@@ -329,6 +337,7 @@ static void test_literal_metadata(void)
     copy[meta_pos + TEST_RE_META_HEADER_LEN] = 'z';
     expect_invalid(copy, len);
     free(copy);
+    expect_invalid(buf, len - 1);
     free(buf);
 
     buf = compile_regexp("\\u1234x", 0, &len);
@@ -340,6 +349,14 @@ static void test_literal_metadata(void)
     free(buf);
 
     buf = compile_regexp("a.c", 0, &len);
+    assert(lre_get_flags(buf) & LRE_FLAG_HAS_META);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE && meta.length == 0);
+    assert(meta.exec_flags == LRE_META_EXEC_SCAN);
+    assert(meta.leading_count == 0 && meta.payload_size == 0);
+    free(buf);
+
+    buf = compile_regexp("a.c", LRE_FLAG_STICKY, &len);
     assert(!(lre_get_flags(buf) & LRE_FLAG_HAS_META));
     assert(lre_get_metadata(buf, len, &meta) == 0);
     free(buf);
@@ -385,12 +402,51 @@ static void test_prefix_metadata(void)
     assert(memcmp(meta.payload, "abc", 3) == 0);
     free(buf);
 
+    buf = compile_regexp("abcdefghijklmnopqrstuvwxyzABCDEF[0-9]+", 0,
+                         &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_PREFIX &&
+           meta.length == LRE_PREFIX_MAX_LENGTH);
+    assert(meta.payload_size == LRE_PREFIX_MAX_LENGTH);
+    assert(memcmp(meta.payload, "abcdefghijklmnopqrstuvwxyzABCDEF",
+                  LRE_PREFIX_MAX_LENGTH) == 0);
+    free(buf);
+
+    buf = compile_regexp("abcdefghijklmnopqrstuvwxyzABCDEFG[0-9]+", 0,
+                         &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_PREFIX &&
+           meta.length == LRE_PREFIX_MAX_LENGTH);
+    assert(memcmp(meta.payload, "abcdefghijklmnopqrstuvwxyzABCDEF",
+                  LRE_PREFIX_MAX_LENGTH) == 0);
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_LENGTH_OFFSET,
+            LRE_PREFIX_MAX_LENGTH + 1);
+    expect_invalid(copy, len);
+    free(copy);
+    free(buf);
+
+    buf = compile_regexp("abcdef(?<word>[0-9]+)", 0, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_PREFIX && meta.length == 6);
+    assert(lre_get_groupnames(buf, len) != NULL);
+    free(buf);
+
     buf = compile_regexp("^abcdef[0-9]+", 0, &len);
-    assert(lre_get_metadata(buf, len, &meta) == 0);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE &&
+           meta.exec_flags == LRE_META_EXEC_SCAN);
     free(buf);
 
     buf = compile_regexp("ab(c)?def", 0, &len);
-    assert(lre_get_metadata(buf, len, &meta) == 0);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE &&
+           meta.exec_flags == LRE_META_EXEC_SCAN);
     free(buf);
 }
 
@@ -432,8 +488,112 @@ static void test_quick_check_metadata(void)
     free(buf);
 
     buf = compile_regexp("[a-z]b", 0, &len);
-    assert(lre_get_metadata(buf, len, &meta) == 0);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE &&
+           meta.exec_flags == LRE_META_EXEC_SCAN);
     free(buf);
+}
+
+static void test_execution_descriptor(void)
+{
+    LREMetadata meta;
+    uint8_t *buf, *copy;
+    size_t meta_pos;
+    int len;
+
+    buf = compile_regexp("(^|[^\\\\])\"x\"", 0, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE);
+    assert(meta.exec_flags ==
+           (LRE_META_EXEC_SCAN | LRE_META_EXEC_LEADING));
+    assert(meta.entry_offset == 11 && meta.leading_count == 3);
+    assert(get_u32(meta.leading_chars) == '"');
+    assert(get_u32(meta.leading_chars + 4) == 'x');
+    assert(get_u32(meta.leading_chars + 8) == '"');
+
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_EXEC_FLAGS_OFFSET,
+            LRE_META_EXEC_LEADING);
+    expect_invalid(copy, len);
+    free(copy);
+
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_LEADING_COUNT_OFFSET,
+            LRE_META_LEADING_MAX + 1);
+    expect_invalid(copy, len);
+    free(copy);
+
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_HEADER_LEN, 'z');
+    expect_invalid(copy, len);
+    free(copy);
+    free(buf);
+}
+
+static void test_descriptor_generic_differential(void)
+{
+    static const char * const patterns[] = {
+        "a.c",
+        "(^|[^\\\\])\"x\"",
+        "(a|ab)+c",
+        "(?=(ab+))ab+c",
+        "[a-z]bcdef",
+        "abcdef[0-9]+",
+    };
+    uint32_t state = 0x5eed1234;
+    char subject[65];
+    size_t case_index, i, j;
+
+    for(case_index = 0; case_index < countof(patterns); case_index++) {
+        uint8_t *buf, *generic;
+        uint8_t **capture, **generic_capture;
+        int alloc_count, capture_count, len;
+
+        buf = compile_regexp(patterns[case_index], 0, &len);
+        generic = dup_bytecode(buf, len);
+        put_u16(generic + TEST_RE_HEADER_FLAGS,
+                get_u16(generic + TEST_RE_HEADER_FLAGS) &
+                ~(LRE_FLAG_HAS_META | LRE_FLAG_ATOM));
+        capture_count = lre_get_capture_count(buf);
+        alloc_count = lre_get_alloc_count(buf);
+        capture = calloc(alloc_count, sizeof(*capture));
+        generic_capture = calloc(alloc_count,
+                                 sizeof(*generic_capture));
+        assert(capture != NULL && generic_capture != NULL);
+
+        for(i = 0; i < 200; i++) {
+            int ret, generic_ret;
+
+            for(j = 0; j < sizeof(subject) - 1; j++) {
+                state = state * 1664525 + 1013904223;
+                subject[j] = "abcxyz0\\\""[state % 9];
+            }
+            subject[sizeof(subject) - 1] = '\0';
+            ret = lre_exec(capture, buf, (const uint8_t *)subject, 0,
+                           sizeof(subject) - 1, 0, NULL);
+            generic_ret = lre_exec(generic_capture, generic,
+                                   (const uint8_t *)subject, 0,
+                                   sizeof(subject) - 1, 0, NULL);
+            assert(ret == generic_ret);
+            if (ret == 1) {
+                for(j = 0; j < (size_t)capture_count * 2; j++) {
+                    if (capture[j] == NULL || generic_capture[j] == NULL) {
+                        assert(capture[j] == generic_capture[j]);
+                    } else {
+                        assert(capture[j] - (uint8_t *)subject ==
+                               generic_capture[j] - (uint8_t *)subject);
+                    }
+                }
+            }
+        }
+        free(generic_capture);
+        free(capture);
+        free(generic);
+        free(buf);
+    }
 }
 
 static void test_arbitrary_bytecode(void)
@@ -463,6 +623,8 @@ int main(void)
     test_literal_metadata();
     test_prefix_metadata();
     test_quick_check_metadata();
+    test_execution_descriptor();
+    test_descriptor_generic_differential();
     test_arbitrary_bytecode();
     return 0;
 }

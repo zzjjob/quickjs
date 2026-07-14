@@ -39,13 +39,21 @@
 #define LRE_FLAG_ATOM       (1 << 9) /* internal: raw literal pattern */
 #define LRE_FLAG_HAS_META   (1 << 10) /* internal optimization metadata */
 
-#define LRE_META_VERSION 1
+/* RegExp optimization metadata is serialized little-endian after the opcode
+   stream. Source literals borrow their payload from JSRegExp.pattern; all
+   other payloads are bounded so untrusted bytecode cannot request an
+   unbounded fast-path allocation or comparison. */
+#define LRE_META_VERSION 3
 #define LRE_META_NONE 0
 #define LRE_META_LITERAL 1
 #define LRE_META_PREFIX 2
 #define LRE_META_QUICK_CHECK 3
 
-#define LRE_META_FLAG_SOURCE 1 /* literal payload equals the source pattern */
+#define LRE_META_FLAG_SOURCE 1 /* literal uses the source pattern; no payload */
+
+#define LRE_LITERAL_MAX_LENGTH 4096
+#define LRE_PREFIX_MIN_LENGTH 3
+#define LRE_PREFIX_MAX_LENGTH 32
 
 #define LRE_META_VERSION_OFFSET 0
 #define LRE_META_KIND_OFFSET 1
@@ -54,7 +62,13 @@
 #define LRE_META_PAYLOAD_SIZE_OFFSET 4
 #define LRE_META_LENGTH_OFFSET 8
 #define LRE_META_ENTRY_OFFSET 12
-#define LRE_META_HEADER_LEN 16
+#define LRE_META_EXEC_FLAGS_OFFSET 16
+#define LRE_META_LEADING_COUNT_OFFSET 20
+#define LRE_META_HEADER_LEN 24
+
+#define LRE_META_EXEC_SCAN (1 << 0)
+#define LRE_META_EXEC_LEADING (1 << 1)
+#define LRE_META_LEADING_MAX 4
 
 #define LRE_QUICK_CHECK_OFFSET 0
 #define LRE_QUICK_CHECK_VALUE 2
@@ -64,9 +78,13 @@
 
 typedef struct LREMetadata {
     const uint8_t *payload;
+    const uint8_t *leading_chars;
     uint32_t payload_size;
+    uint32_t primary_payload_size;
     uint32_t length;
     uint32_t entry_offset;
+    uint32_t exec_flags;
+    uint32_t leading_count;
     uint8_t kind;
     uint8_t encoding;
     uint8_t flags;

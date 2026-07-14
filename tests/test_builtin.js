@@ -814,6 +814,7 @@ function test_date()
 function test_regexp()
 {
     var a, str, re, calls, callback_args, seed, i, j, s, fast, generic;
+    var compile_cases, compile_case, other_re;
     str = "abbbbbc";
     a = /(b+)c/.exec(str);
     assert(a[0], "bbbbbc");
@@ -986,6 +987,98 @@ function test_regexp()
     assert(/[a-z]bcdef/.exec("000000xbcdeg"), null);
     assert(/[a-z]bcdef/.exec("0000000"), null);
     assert("xbcdef ybcdef".replace(/[a-z]bcdef/g, "X"), "X X");
+
+    /* RegExp.prototype.compile() must refresh bytecode-owned metadata. */
+    compile_cases = [
+        ["abcdef[0-9]+", "(a|b)+", undefined, "bbbb", ["bbbb", "b"], 0],
+        ["[a-z]bcdef", "abc", undefined, "zabc", ["abc"], 1],
+        ["abcdef[0-9]+", "uvwxyz[0-9]+", undefined,
+         "--uvwxyz42", ["uvwxyz42"], 2],
+        ["abc", "\\x78yz", undefined, "-xyz", ["xyz"], 1],
+        ["(a|b)+", "abcdef[0-9]+", undefined,
+         "-abcdef7", ["abcdef7"], 1],
+        ["(a|b)+", "[a-z]bcdef", undefined, "-xbcdef", ["xbcdef"], 1],
+        ["(a|b)+", "abc", undefined, "-abc", ["abc"], 1],
+    ];
+    for (i = 0; i < compile_cases.length; i++) {
+        compile_case = compile_cases[i];
+        re = new RegExp(compile_case[0]);
+        re.compile(compile_case[1], compile_case[2]);
+        a = re.exec(compile_case[3]);
+        assert(Array.prototype.slice.call(a), compile_case[4]);
+        assert(a.index, compile_case[5]);
+        assert(a.input, compile_case[3]);
+    }
+
+    re = new RegExp("abcdef[0-9]+");
+    other_re = new RegExp("[a-z]bcdef");
+    re.compile(other_re);
+    a = re.exec("-xbcdef");
+    assert(Array.prototype.slice.call(a), ["xbcdef"]);
+    assert(a.index, 1);
+    re.compile(re);
+    assert(re.exec("-xbcdef")[0], "xbcdef");
+
+    re = new RegExp("abcdef[0-9]+");
+    re.lastIndex = 42;
+    re.compile("abc", "g");
+    assert(re.lastIndex, 0);
+    a = re.exec("-abcabc");
+    assert(a[0], "abc");
+    assert(a.index, 1);
+    assert(re.lastIndex, 4);
+    a = re.exec("-abcabc");
+    assert(a.index, 4);
+    assert(re.lastIndex, 7);
+    assert(re.exec("-abcabc"), null);
+    assert(re.lastIndex, 0);
+
+    re = new RegExp("abcdef[0-9]+");
+    re.compile("abc", "y");
+    re.lastIndex = 1;
+    assert(re.exec("-abc")[0], "abc");
+    assert(re.lastIndex, 4);
+    re.lastIndex = 0;
+    assert(re.exec("-abc"), null);
+    assert(re.lastIndex, 0);
+
+    re = new RegExp("abcdef[0-9]+");
+    re.compile("abc", "i");
+    assert(re.exec("-ABC")[0], "ABC");
+    re.compile("abc", "u");
+    assert(re.exec("-abc")[0], "abc");
+    re.compile("abc", "v");
+    assert(re.exec("-abc")[0], "abc");
+    re.compile("abc", "d");
+    a = re.exec("-abc");
+    assert(a[0], "abc");
+    assert(a.indices[0], [1, 4]);
+
+    re = new RegExp("abcdef[0-9]+");
+    re.compile("abc", "g");
+    assert("abc abc".replace(re, "X"), "X X");
+    re.compile("(a|b)+");
+    assert("--abba--".replace(re, "<$1>"), "--<a>--");
+    re.compile("abc");
+    assert(re.test("-abc"), true);
+
+    re = new RegExp("abcdef[0-9]+");
+    assert_throws(SyntaxError, function() { re.compile("abc", "gg"); });
+    assert(re.exec("-abcdef7")[0], "abcdef7");
+
+    re = new RegExp("abcdef[0-9]+");
+    Object.defineProperty(re, "lastIndex", { writable: false });
+    assert_throws(TypeError, function() { re.compile("(a|b)+"); });
+    assert(re.exec("bbbb")[0], "bbbb");
+
+    re = new RegExp("abcdef[0-9]+");
+    for (i = 0; i < 1000; i++) {
+        re.compile((i & 1) ? "abcdef[0-9]+" : "(a|b)+");
+        if ((i & 63) == 0 && typeof std !== "undefined")
+            std.gc();
+    }
+    re.compile("(a|b)+");
+    assert(re.exec("bbbb")[0], "bbbb");
 
     /* generic candidate scanning outside the backtracking stack */
     a = /(a|ab)c/.exec("xxabc");

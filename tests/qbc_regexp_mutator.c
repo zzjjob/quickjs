@@ -175,6 +175,14 @@ static void mutate_regexp(uint8_t *payload, size_t payload_len,
         target[8] = 0xff;
     } else if (!strcmp(mode, "bad-metadata-version")) {
         metadata[LRE_META_VERSION_OFFSET]++;
+    } else if (!strcmp(mode, "bad-source-payload")) {
+        metadata[LRE_META_FLAGS_OFFSET] |= LRE_META_FLAG_SOURCE;
+    } else if (!strcmp(mode, "bad-scan-entry")) {
+        put_u32(metadata + LRE_META_ENTRY_OFFSET,
+                get_u32(metadata + LRE_META_ENTRY_OFFSET) + 1);
+    } else if (!strcmp(mode, "bad-leading-char")) {
+        put_u32(metadata + LRE_META_HEADER_LEN,
+                get_u32(metadata + LRE_META_HEADER_LEN) + 1);
     } else if (!strcmp(mode, "bad-prefix-entry")) {
         put_u32(metadata + LRE_META_ENTRY_OFFSET,
                 get_u32(metadata + LRE_META_ENTRY_OFFSET) + 1);
@@ -208,6 +216,13 @@ int main(int argc, char **argv)
         die("invalid QBC payload size");
     payload = buf + QBC_HEADER_SIZE;
 
+    if (!strcmp(mode, "old-bytecode-version")) {
+        if (payload_len == 0)
+            die("bytecode payload is empty");
+        payload[0]--;
+        goto write_output;
+    }
+
     if (!strcmp(mode, "forge-atom-capture")) {
         mutate_regexp(payload, payload_len, "(abc)", "forge-atom");
     } else if (!strcmp(mode, "forge-atom-nonliteral")) {
@@ -221,6 +236,12 @@ int main(int argc, char **argv)
         mutate_regexp(payload, payload_len, "abc", mode);
     } else if (!strcmp(mode, "bad-metadata-version")) {
         mutate_regexp(payload, payload_len, "abc", mode);
+    } else if (!strcmp(mode, "bad-source-payload")) {
+        mutate_regexp(payload, payload_len, "\\x61bc", mode);
+    } else if (!strcmp(mode, "bad-scan-entry")) {
+        mutate_regexp(payload, payload_len, "a.c", mode);
+    } else if (!strcmp(mode, "bad-leading-char")) {
+        mutate_regexp(payload, payload_len, "(^|[^\\\\])\"x\"", mode);
     } else if (!strcmp(mode, "bad-prefix-entry")) {
         mutate_regexp(payload, payload_len, "abcdef[0-9]+", mode);
     } else if (!strcmp(mode, "bad-quick-check")) {
@@ -231,6 +252,7 @@ int main(int argc, char **argv)
         die("unknown mutation mode");
     }
 
+write_output:
     put_u64(buf + QBC_CHECKSUM_OFFSET, qbc_checksum(payload, payload_len));
     write_file(output, buf, len);
     free(buf);
