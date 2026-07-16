@@ -100,9 +100,15 @@ int main(void)
     run_long_scan(rt, ctx, "!/abcdef[0-9]+/.test(sparse8)");
     run_long_scan(rt, ctx, "!/[a-z]bcdef/.test(sparse8)");
     run_long_scan(rt, ctx, "!/(^|[^\\\\])\"target\"/.test(subject8)");
+    run_long_scan(rt, ctx, "!/abcdef[0-9]+/i.test(sparse8)");
+    run_long_scan(rt, ctx, "!/[a-z]bcdef/i.test(sparse8)");
+    run_long_scan(rt, ctx, "!/(^|x)target/i.test(subject8)");
+    run_long_scan(rt, ctx, "!/abcdef/iu.test(subject16)");
     run_long_scan(rt, ctx, "!/(?:^|.)abcd/.test(subject16)");
     run_long_scan(rt, ctx,
                   "subject8.replace(/zzzzzz/g, 'X') === subject8");
+    run_long_scan(rt, ctx,
+                  "sparse8.replace(/abcdef[0-9]+/ig, 'X') === sparse8");
 
     run_case(rt, ctx, "/aaaa/.test(subject8)", 0, 0);
 

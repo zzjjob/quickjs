@@ -89,6 +89,9 @@ var results = [
     /abcdef[0-9]+/.exec("zabcdef1")[0],
     /[a-z]bcdef/.exec("zxbcdef")[0],
     /(^|[^\\])"x"/.exec('00"x"')[0],
+    /abcdef[0-9]+/i.exec("zABCDEF2")[0],
+    /[a-z]bcdef/i.exec("zXBCDEF")[0],
+    /(^|x)abc/i.exec("00xABC")[0],
 ];
 console.log(results.join(","));
 console.log("regexp qbc validation sentinel");
@@ -106,7 +109,7 @@ EOF
     "$TMP_DIR/regexp-clear-atom.qbc" clear-atom
 "$QJS" --bytecode "$TMP_DIR/regexp-clear-atom.qbc" \
     > "$TMP_DIR/regexp-clear-atom.out"
-if ! grep -q '^abc,abc,abc,a-c,abcdef1,xbcdef,0"x"$' "$TMP_DIR/regexp-clear-atom.out"; then
+if ! grep -q '^abc,abc,abc,a-c,abcdef1,xbcdef,0"x",ABCDEF2,XBCDEF,xABC$' "$TMP_DIR/regexp-clear-atom.out"; then
     echo "qjs rejected or misexecuted a safe missing ATOM marker" >&2
     cat "$TMP_DIR/regexp-clear-atom.out" >&2
     exit 1
@@ -114,7 +117,8 @@ fi
 
 for mode in forge-atom-capture forge-atom-nonliteral bad-regexp-opcode \
     bad-metadata-version bad-source-payload bad-scan-entry \
-    bad-leading-char bad-prefix-entry bad-quick-check bad-function-opcode; do
+    bad-leading-char bad-prefix-entry bad-quick-check bad-icase-prefix \
+    bad-icase-quick-check bad-icase-leading-char bad-function-opcode; do
     mutation_input="$TMP_DIR/regexp-validation.qbc"
     if [ "$mode" = bad-function-opcode ]; then
         mutation_input="$TMP_DIR/regexp-function-validation.qbc"

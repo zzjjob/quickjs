@@ -1118,6 +1118,49 @@ function test_regexp()
     assert(/(^|x)abc/.exec("00xabc").index, 2);
     assert(/(^|\s)abc/.exec("00 abc").index, 2);
     assert(/(^|x)abc/i.exec("00XABC").index, 2);
+
+    /* ASCII /i descriptors must preserve captures, indices and fallbacks. */
+    a = /abcdef[0-9]+/i.exec("abcdefX---ABCDEF42");
+    assert(a[0], "ABCDEF42");
+    assert(a.index, 10);
+    assert(/abcdef[0-9]+/i.exec("abcdefX---abcdeg42"), null);
+    a = /[a-z]bcdef/i.exec("000000XBCDEF");
+    assert(a[0], "XBCDEF");
+    assert(a.index, 6);
+    assert(/[a-z]bcdef/i.exec("000000XBCDEG"), null);
+    assert("ABCDEF1 abcdef2".replace(/abcdef[0-9]+/gi, "X"), "X X");
+
+    a = /(^|x)abc/i.exec("00XABC");
+    assert(a[0], "XABC");
+    assert(a[1], "X");
+    assert(a.index, 2);
+    a = /(^|x)abc/i.exec("ABC");
+    assert(a[0], "ABC");
+    assert(a[1], "");
+    assert(/(^|x)abc/i.exec("00YABC"), null);
+    assert("XABC xabc".replace(/(^|x)abc/gi, "Q"), "Q Q");
+
+    assert(/(abc)\1/i.exec("--abcABC")[0], "abcABC");
+    assert(/[a-c]+/i.exec("--aBcC")[0], "aBcC");
+    a = /abcdef[0-9]+/id.exec("\u0100---ABCDEF7");
+    assert(a.index, 4);
+    assert(a.indices[0], [4, 11]);
+
+    re = /abc/iy;
+    re.lastIndex = 1;
+    assert(re.exec("-ABC")[0], "ABC");
+    assert(re.lastIndex, 4);
+    re.lastIndex = 0;
+    assert(re.exec("-ABC"), null);
+
+    /* Unicode folding stays on the generic path in this optimization tier. */
+    assert(/kilo/iu.exec("\u212aILO")[0], "\u212aILO");
+    assert(/sabc/iu.exec("\u017fABC")[0], "\u017fABC");
+    assert(/k/i.test("\u212a"), false);
+    assert(/s/i.test("\u017f"), false);
+    assert(/abc/iu.exec("\u{1f431}ABC").index, 2);
+    assert(/abc/iv.exec("\u0100ABC").index, 1);
+
     re = /(^|x)abc/y;
     re.lastIndex = 2;
     assert(re.exec("00xabc")[0], "xabc");

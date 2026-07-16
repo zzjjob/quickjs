@@ -1103,6 +1103,83 @@ function regexp_quick_check_miss(n)
     return n * 1000;
 }
 
+function regexp_icase_prefix_late(n)
+{
+    var i, j, r, s = "xxxxxxxxxxxxxxxxxxxxxxxxABCDEF123";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /abcdef[0-9]+/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_prefix_miss(n)
+{
+    var i, j, r, s = "ABCDEFxXxxxxxxxxxxxxxxxxxxxxxxxxx";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /abcdef[0-9]+/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_quick_check_late(n)
+{
+    var i, j, r, s = "000000000000000000000000XBCDEF";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /[a-z]bcdef/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_quick_check_miss(n)
+{
+    var i, j, r, s = "000000000000000000000000XBCDEG";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /[a-z]bcdef/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_leading_late(n)
+{
+    var i, j, r, s = "000000000000000000000000xABCDEF";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /(^|x)abcdef/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_leading_miss(n)
+{
+    var i, j, r, s = "000000000000000000000000xABCDEG";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = /(^|x)abcdef/i.exec(s);
+        global_res = r;
+    }
+    return n * 1000;
+}
+
+function regexp_icase_replace(n)
+{
+    var i, j, r, s = "00ABCDEF12 xxabcdef34 yyABCDEF56";
+    for(j = 0; j < n; j++) {
+        for(i = 0; i < 1000; i++)
+            r = s.replace(/abcdef[0-9]+/ig, "X");
+        global_res = r;
+    }
+    return n * 1000;
+}
+
 function string_length(n)
 {
     var str, sum, j;
@@ -1603,6 +1680,13 @@ function main(argc, argv, g)
         regexp_prefix_miss,
         regexp_quick_check_late,
         regexp_quick_check_miss,
+        regexp_icase_prefix_late,
+        regexp_icase_prefix_miss,
+        regexp_icase_quick_check_late,
+        regexp_icase_quick_check_miss,
+        regexp_icase_leading_late,
+        regexp_icase_leading_miss,
+        regexp_icase_replace,
         string_length,
         string_build1,
         string_build1x,
