@@ -119,6 +119,23 @@ int unicode_sequence_prop(const char *prop_name, UnicodeSequencePropCB *cb, void
 int lre_case_conv(uint32_t *res, uint32_t c, int conv_type);
 int lre_canonicalize(uint32_t c, int is_unicode);
 
+/* RegExp workloads are overwhelmingly ASCII; keep the out-of-line Unicode
+   canonicalization call out of hot interpreter and candidate-scanning loops. */
+static inline uint32_t lre_canonicalize_fast(uint32_t c, int is_unicode)
+{
+    if (c < 128) {
+        if (is_unicode) {
+            if (c >= 'A' && c <= 'Z')
+                c += 'a' - 'A';
+        } else {
+            if (c >= 'a' && c <= 'z')
+                c -= 'a' - 'A';
+        }
+        return c;
+    }
+    return lre_canonicalize(c, is_unicode);
+}
+
 /* Code point type categories */
 enum {
     UNICODE_C_SPACE  = (1 << 0),

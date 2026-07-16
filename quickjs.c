@@ -48657,6 +48657,53 @@ static force_inline int js_regexp_indexof_char_range(JSString *str, int c,
     return -1;
 }
 
+static force_inline int
+js_regexp_indexof_canonical_char_range(JSString *str, int c,
+                                       int from, int to)
+{
+    int i;
+
+    if (str->is_wide_char) {
+        for(i = from; i < to; i++) {
+            if (lre_canonicalize_fast(str->u.str16[i], FALSE) == (uint32_t)c)
+                return i;
+        }
+    } else if (c >= 'A' && c <= 'Z') {
+        const uint8_t *p1, *p2;
+
+        p1 = memchr(str->u.str8 + from, c, to - from);
+        p2 = memchr(str->u.str8 + from, c + ('a' - 'A'), to - from);
+        if (p1 && (!p2 || p1 < p2))
+            return p1 - str->u.str8;
+        if (p2)
+            return p2 - str->u.str8;
+    } else {
+        return js_regexp_indexof_char_range(str, c, from, to);
+    }
+    return -1;
+}
+
+static force_inline BOOL
+js_regexp_prefix_starts_at(JSString *str, int start, const uint8_t *prefix,
+                           BOOL ignore_case)
+{
+    int i, len = get_u32(prefix + LRE_META_LENGTH_OFFSET);
+
+    if (!ignore_case)
+        return js_regexp_atom_starts_at(str, start, prefix);
+    if (len > str->len - start)
+        return FALSE;
+    for(i = 0; i < len; i++) {
+        uint32_t c = string_get(str, start + i);
+
+        if (lre_canonicalize_fast(c, FALSE) !=
+            (uint32_t)js_regexp_atom_char(prefix, i)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 static int js_regexp_find_source_atom(JSContext *ctx, JSString *str,
                                       JSString *pattern, int start_index,
                                       int *pstart)
@@ -48768,13 +48815,15 @@ static force_inline int js_regexp_match_atom(JSContext *ctx,
 static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
                                   const uint8_t *re_bytecode,
                                   const uint8_t *prefix, JSString *str,
-                                  int start_index)
+                                  int start_index, int re_flags)
 {
     int c, candidate, chunk_end, ret, len, limit, shift;
+    BOOL ignore_case;
 
     len = get_u32(prefix + LRE_META_LENGTH_OFFSET);
     shift = str->is_wide_char;
     c = js_regexp_atom_char(prefix, 0);
+    ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
     candidate = start_index;
     if (len > str->len)
         return 0;
@@ -48783,11 +48832,17 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
         chunk_end = candidate +
             min_int(limit - candidate, JS_REGEXP_SCAN_CHUNK_SIZE);
         while (candidate < chunk_end) {
-            candidate = js_regexp_indexof_char_range(str, c, candidate,
-                                                     chunk_end);
+            if (ignore_case) {
+                candidate = js_regexp_indexof_canonical_char_range(
+                    str, c, candidate, chunk_end);
+            } else {
+                candidate = js_regexp_indexof_char_range(str, c, candidate,
+                                                         chunk_end);
+            }
             if (candidate < 0)
                 break;
-            if (js_regexp_atom_starts_at(str, candidate, prefix)) {
+            if (js_regexp_prefix_starts_at(str, candidate, prefix,
+                                           ignore_case)) {
                 ret = lre_exec_at(capture, re_bytecode,
                                   get_u32(prefix + LRE_META_ENTRY_OFFSET),
                                   str->u.str8, candidate, str->len, shift, ctx);
@@ -48806,17 +48861,20 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
 static int js_regexp_match_quick_check(JSContext *ctx, uint8_t **capture,
                                        const uint8_t *re_bytecode,
                                        const uint8_t *quick_check,
-                                       JSString *str, int start_index)
+                                       JSString *str, int start_index,
+                                       int re_flags)
 {
     const uint8_t *payload, *record;
     uint32_t c, count, mask, value;
     int attempts, candidate, i, last_offset, ret, shift;
+    BOOL ignore_case;
 
     count = get_u32(quick_check + LRE_META_LENGTH_OFFSET);
     payload = quick_check + LRE_META_HEADER_LEN;
     record = payload + (count - 1) * LRE_QUICK_CHECK_RECORD_SIZE;
     last_offset = get_u16(record + LRE_QUICK_CHECK_OFFSET);
     shift = str->is_wide_char;
+    ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
     attempts = 0;
     for(candidate = start_index;
         candidate + last_offset < str->len;
@@ -48825,6 +48883,8 @@ static int js_regexp_match_quick_check(JSContext *ctx, uint8_t **capture,
             record = payload + i * LRE_QUICK_CHECK_RECORD_SIZE;
             c = string_get(str, candidate +
                            get_u16(record + LRE_QUICK_CHECK_OFFSET));
+            if (ignore_case)
+                c = lre_canonicalize_fast(c, FALSE);
             value = get_u16(record + LRE_QUICK_CHECK_VALUE);
             mask = get_u16(record + LRE_QUICK_CHECK_MASK);
             if ((c & mask) != value)
@@ -48875,10 +48935,11 @@ js_regexp_match(JSContext *ctx, uint8_t **capture,
                                     start_index);
     } else if (d->prefix) {
         return js_regexp_match_prefix(ctx, capture, d->bytecode, d->prefix,
-                                      str, start_index);
+                                      str, start_index, d->re_flags);
     } else if (d->quick_check) {
         return js_regexp_match_quick_check(ctx, capture, d->bytecode,
-                                           d->quick_check, str, start_index);
+                                           d->quick_check, str, start_index,
+                                           d->re_flags);
     } else {
         return lre_exec(capture, d->bytecode, str->u.str8, start_index,
                         str->len, str->is_wide_char, ctx);

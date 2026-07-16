@@ -238,6 +238,40 @@ static BOOL re_has_literal_body(const uint8_t *bc_buf, size_t bc_buf_len,
     return TRUE;
 }
 
+static BOOL re_read_char_opcode(const uint8_t *code, size_t code_len,
+                                size_t *ppos, BOOL ignore_case, uint32_t *pc)
+{
+    size_t pos = *ppos;
+    int opcode16 = ignore_case ? REOP_char_i : REOP_char;
+    int opcode32 = ignore_case ? REOP_char32_i : REOP_char32;
+    uint32_t c;
+
+    if (pos >= code_len)
+        return FALSE;
+    if (code[pos] == opcode16) {
+        if (pos + 3 > code_len)
+            return FALSE;
+        c = get_u16(code + pos + 1);
+        pos += 3;
+    } else if (code[pos] == opcode32) {
+        if (pos + 5 > code_len)
+            return FALSE;
+        c = get_u32(code + pos + 1);
+        if (c > 0xffff)
+            return FALSE;
+        pos += 5;
+    } else {
+        return FALSE;
+    }
+    /* The first /i descriptor tier deliberately excludes Unicode folding;
+       unsupported patterns retain the generic interpreter path. */
+    if (ignore_case && c >= 128)
+        return FALSE;
+    *ppos = pos;
+    *pc = c;
+    return TRUE;
+}
+
 static BOOL re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
                                  int re_flags, size_t *pentry_pos,
                                  size_t *pchar_pos, uint32_t *plength,
@@ -247,13 +281,15 @@ static BOOL re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
     size_t pos, pos1, pos2, target;
     uint32_t length, c, c1, c2;
     int encoding;
+    BOOL ignore_case;
 
-    if ((re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_STICKY |
-                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ||
+    if ((re_flags & (LRE_FLAG_STICKY | LRE_FLAG_UNICODE |
+                     LRE_FLAG_UNICODE_SETS)) ||
         bc_buf_len < RE_HEADER_LEN + 16 ||
         !re_get_scan_entry(bc_buf, bc_buf_len, &pos)) {
         return FALSE;
     }
+    ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
     code = bc_buf + RE_HEADER_LEN;
     bc_buf_len -= RE_HEADER_LEN;
 
@@ -272,24 +308,12 @@ static BOOL re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
         for (;;) {
             if (pos1 >= bc_buf_len || pos2 >= bc_buf_len)
                 break;
-            if (code[pos1] == REOP_char && pos1 + 3 <= bc_buf_len) {
-                c1 = get_u16(code + pos1 + 1);
-                pos1 += 3;
-            } else if (code[pos1] == REOP_char32 &&
-                       pos1 + 5 <= bc_buf_len) {
-                c1 = get_u32(code + pos1 + 1);
-                pos1 += 5;
-            } else {
+            if (!re_read_char_opcode(code, bc_buf_len, &pos1,
+                                     ignore_case, &c1)) {
                 break;
             }
-            if (code[pos2] == REOP_char && pos2 + 3 <= bc_buf_len) {
-                c2 = get_u16(code + pos2 + 1);
-                pos2 += 3;
-            } else if (code[pos2] == REOP_char32 &&
-                       pos2 + 5 <= bc_buf_len) {
-                c2 = get_u32(code + pos2 + 1);
-                pos2 += 5;
-            } else {
+            if (!re_read_char_opcode(code, bc_buf_len, &pos2,
+                                     ignore_case, &c2)) {
                 break;
             }
             if (c1 != c2 || c1 > 0xffff)
@@ -309,21 +333,8 @@ static BOOL re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
     length = 0;
     encoding = 0;
     while (pos < bc_buf_len) {
-        if (code[pos] == REOP_char) {
-            if (pos + 3 > bc_buf_len)
-                return FALSE;
-            c = get_u16(code + pos + 1);
-            pos += 3;
-        } else if (code[pos] == REOP_char32) {
-            if (pos + 5 > bc_buf_len)
-                return FALSE;
-            c = get_u32(code + pos + 1);
-            if (c > 0xffff)
-                return FALSE;
-            pos += 5;
-        } else {
+        if (!re_read_char_opcode(code, bc_buf_len, &pos, ignore_case, &c))
             break;
-        }
         if (c > 0xff)
             encoding = 1;
         if (length == UINT32_MAX)
@@ -339,7 +350,8 @@ static BOOL re_get_linear_prefix(const uint8_t *bc_buf, size_t bc_buf_len,
     return TRUE;
 }
 
-static int re_append_metadata(REParseState *s, int kind, size_t entry_pos,
+static int re_append_metadata(REParseState *s, int re_flags, int kind,
+                              size_t entry_pos,
                               size_t char_pos, uint32_t length, int encoding,
                               int metadata_flags, uint32_t exec_flags,
                               const uint32_t *leading_chars,
@@ -349,6 +361,7 @@ static int re_append_metadata(REParseState *s, int kind, size_t entry_pos,
     size_t payload_size, primary_payload_size, pos, code_len;
     int i;
     uint32_t c;
+    BOOL ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
 
     if (leading_count < 0 || leading_count > LRE_META_LEADING_MAX ||
         (encoding && length > UINT32_MAX / 2))
@@ -375,13 +388,8 @@ static int re_append_metadata(REParseState *s, int kind, size_t entry_pos,
 
     pos = char_pos;
     while (primary_payload_size != 0 && pos < code_len) {
-        if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char) {
-            c = get_u16(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
-            pos += 3;
-        } else if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char32) {
-            c = get_u32(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
-            pos += 5;
-        } else {
+        if (!re_read_char_opcode(s->byte_code.buf + RE_HEADER_LEN, code_len,
+                                 &pos, ignore_case, &c)) {
             break;
         }
         if (encoding)
@@ -416,7 +424,7 @@ static int re_append_literal_metadata(REParseState *s, int re_flags,
     }
     if (!payload_matches_source && length > LRE_LITERAL_MAX_LENGTH)
         return 0;
-    if (re_append_metadata(s, LRE_META_LITERAL, 11, char_pos, length,
+    if (re_append_metadata(s, re_flags, LRE_META_LITERAL, 11, char_pos, length,
                            encoding, payload_matches_source ?
                            LRE_META_FLAG_SOURCE : 0, exec_flags,
                            leading_chars, leading_count) < 0)
@@ -447,18 +455,16 @@ static int re_append_prefix_metadata(REParseState *s, int re_flags,
         encoding = 0;
         pos = char_pos;
         for(i = 0; i < length; i++) {
-            if (s->byte_code.buf[RE_HEADER_LEN + pos] == REOP_char) {
-                c = get_u16(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
-                pos += 3;
-            } else {
-                c = get_u32(s->byte_code.buf + RE_HEADER_LEN + pos + 1);
-                pos += 5;
-            }
+            if (!re_read_char_opcode(s->byte_code.buf + RE_HEADER_LEN,
+                                     code_len, &pos,
+                                     (re_flags & LRE_FLAG_IGNORECASE) != 0,
+                                     &c))
+                return 0;
             if (c > 0xff)
                 encoding = 1;
         }
     }
-    return re_append_metadata(s, LRE_META_PREFIX, entry_pos, char_pos,
+    return re_append_metadata(s, re_flags, LRE_META_PREFIX, entry_pos, char_pos,
                               length, encoding, 0, exec_flags,
                               leading_chars, leading_count);
 }
@@ -469,18 +475,19 @@ static BOOL re_get_quick_checks(const uint8_t *bc_buf, size_t bc_buf_len,
                                 int *pcount, size_t *pentry_pos)
 {
     const uint8_t *code;
-    size_t pos;
+    size_t pos, next_pos;
     uint32_t c, diff, low, high, range_mask, range_value;
     uint32_t check_mask, check_value;
     int count, consumed, i, n;
-    BOOL first;
+    BOOL first, ignore_case;
 
-    if ((re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_STICKY |
-                     LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ||
+    if ((re_flags & (LRE_FLAG_STICKY | LRE_FLAG_UNICODE |
+                     LRE_FLAG_UNICODE_SETS)) ||
         bc_buf_len < RE_HEADER_LEN + 16 ||
         !re_get_scan_entry(bc_buf, bc_buf_len, &pos)) {
         return FALSE;
     }
+    ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
     code = bc_buf + RE_HEADER_LEN;
     bc_buf_len -= RE_HEADER_LEN;
 
@@ -489,22 +496,14 @@ static BOOL re_get_quick_checks(const uint8_t *bc_buf, size_t bc_buf_len,
     for(consumed = 0; consumed < LRE_QUICK_CHECK_MAX; consumed++) {
         check_mask = 0;
         check_value = 0;
-        if (pos < bc_buf_len && code[pos] == REOP_char) {
-            if (pos + 3 > bc_buf_len)
-                return FALSE;
-            check_mask = 0xffff;
-            check_value = get_u16(code + pos + 1);
-            pos += 3;
-        } else if (pos < bc_buf_len && code[pos] == REOP_char32) {
-            if (pos + 5 > bc_buf_len)
-                return FALSE;
-            c = get_u32(code + pos + 1);
-            if (c > 0xffff)
-                break;
+        next_pos = pos;
+        if (re_read_char_opcode(code, bc_buf_len, &next_pos,
+                                ignore_case, &c)) {
             check_mask = 0xffff;
             check_value = c;
-            pos += 5;
-        } else if (pos < bc_buf_len && code[pos] == REOP_range) {
+            pos = next_pos;
+        } else if (pos < bc_buf_len &&
+                   code[pos] == (ignore_case ? REOP_range_i : REOP_range)) {
             if (pos + 3 > bc_buf_len)
                 return FALSE;
             n = get_u16(code + pos + 1);
@@ -514,6 +513,8 @@ static BOOL re_get_quick_checks(const uint8_t *bc_buf, size_t bc_buf_len,
             for(i = 0; i < n; i++) {
                 low = get_u16(code + pos + 3 + i * 4);
                 high = get_u16(code + pos + 5 + i * 4);
+                if (ignore_case && (low >= 128 || high >= 128))
+                    return FALSE;
                 diff = low ^ high;
                 range_mask = 0xffff;
                 while (diff) {
@@ -600,7 +601,9 @@ static BOOL re_single_char_opcode_end(const uint8_t *code, size_t code_len,
     opcode = code[pos];
     switch(opcode) {
     case REOP_char:
+    case REOP_char_i:
     case REOP_char32:
+    case REOP_char32_i:
     case REOP_dot:
     case REOP_any:
     case REOP_space:
@@ -608,6 +611,7 @@ static BOOL re_single_char_opcode_end(const uint8_t *code, size_t code_len,
         len = reopcode_info[opcode].size;
         break;
     case REOP_range:
+    case REOP_range_i:
         if (pos + 3 > code_len)
             return FALSE;
         n = get_u16(code + pos + 1);
@@ -616,6 +620,7 @@ static BOOL re_single_char_opcode_end(const uint8_t *code, size_t code_len,
         len = 3 + (size_t)n * 4;
         break;
     case REOP_range32:
+    case REOP_range32_i:
         if (pos + 3 > code_len)
             return FALSE;
         n = get_u16(code + pos + 1);
@@ -640,13 +645,14 @@ static BOOL re_get_leading_char_filter(const uint8_t *bc_buf,
 {
     const uint8_t *code;
     size_t pos, branch1, branch2, branch2_end, join;
-    int capture_index, char_count, opcode;
+    int capture_index, char_count;
     uint32_t c;
+    BOOL ignore_case;
 
-    if (re_flags & (LRE_FLAG_IGNORECASE | LRE_FLAG_MULTILINE |
-                    LRE_FLAG_STICKY | LRE_FLAG_UNICODE |
+    if (re_flags & (LRE_FLAG_MULTILINE | LRE_FLAG_STICKY | LRE_FLAG_UNICODE |
                     LRE_FLAG_UNICODE_SETS))
         return FALSE;
+    ignore_case = (re_flags & LRE_FLAG_IGNORECASE) != 0;
     if (bc_buf_len < RE_HEADER_LEN + 20 ||
         !re_get_scan_entry(bc_buf, bc_buf_len, &pos))
         return FALSE;
@@ -683,22 +689,8 @@ static BOOL re_get_leading_char_filter(const uint8_t *bc_buf,
     }
     char_count = 0;
     while (pos < bc_buf_len && char_count < LRE_META_LEADING_MAX) {
-        opcode = code[pos];
-        if (opcode == REOP_char) {
-            if (pos + 3 > bc_buf_len)
-                return FALSE;
-            c = get_u16(code + pos + 1);
-            pos += 3;
-        } else if (opcode == REOP_char32) {
-            if (pos + 5 > bc_buf_len)
-                return FALSE;
-            c = get_u32(code + pos + 1);
-            if (c > 0xffff)
-                return FALSE;
-            pos += 5;
-        } else {
+        if (!re_read_char_opcode(code, bc_buf_len, &pos, ignore_case, &c))
             break;
-        }
         chars[char_count++] = c;
     }
     if (char_count == 0)
@@ -3282,8 +3274,8 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                                                          leading_chars,
                                                          leading_count);
     if (metadata_result == 0 && exec_flags != 0) {
-        metadata_result = re_append_metadata(s, LRE_META_NONE, scan_entry, 0,
-                                             0, 0, 0, exec_flags,
+        metadata_result = re_append_metadata(s, re_flags, LRE_META_NONE,
+                                             scan_entry, 0, 0, 0, 0, exec_flags,
                                              leading_chars, leading_count);
     }
     if (metadata_result < 0) {
@@ -3639,7 +3631,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 goto no_match;
             GET_CHAR(c, cptr, cbuf_end, cbuf_type);
             if (opcode == REOP_char_i || opcode == REOP_char32_i) {
-                c = lre_canonicalize(c, s->is_unicode);
+                c = lre_canonicalize_fast(c, s->is_unicode);
             }
             if (val != c)
                 goto no_match;
@@ -3902,8 +3894,8 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                                 GET_CHAR(c1, cptr1, cptr1_end, cbuf_type);
                                 GET_CHAR(c2, cptr, cbuf_end, cbuf_type);
                                 if (opcode == REOP_back_reference_i) {
-                                    c1 = lre_canonicalize(c1, s->is_unicode);
-                                    c2 = lre_canonicalize(c2, s->is_unicode);
+                                    c1 = lre_canonicalize_fast(c1, s->is_unicode);
+                                    c2 = lre_canonicalize_fast(c2, s->is_unicode);
                                 }
                                 if (c1 != c2)
                                     goto no_match;
@@ -3916,8 +3908,8 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                                 GET_PREV_CHAR(c1, cptr1, cptr1_start, cbuf_type);
                                 GET_PREV_CHAR(c2, cptr, s->cbuf, cbuf_type);
                                 if (opcode == REOP_backward_back_reference_i) {
-                                    c1 = lre_canonicalize(c1, s->is_unicode);
-                                    c2 = lre_canonicalize(c2, s->is_unicode);
+                                    c1 = lre_canonicalize_fast(c1, s->is_unicode);
+                                    c2 = lre_canonicalize_fast(c2, s->is_unicode);
                                 }
                                 if (c1 != c2)
                                     goto no_match;
@@ -3940,7 +3932,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                     goto no_match;
                 GET_CHAR(c, cptr, cbuf_end, cbuf_type);
                 if (opcode == REOP_range_i) {
-                    c = lre_canonicalize(c, s->is_unicode);
+                    c = lre_canonicalize_fast(c, s->is_unicode);
                 }
                 idx_min = 0;
                 low = get_u16(pc + 0 * 4);
@@ -3981,7 +3973,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                     goto no_match;
                 GET_CHAR(c, cptr, cbuf_end, cbuf_type);
                 if (opcode == REOP_range32_i) {
-                    c = lre_canonicalize(c, s->is_unicode);
+                    c = lre_canonicalize_fast(c, s->is_unicode);
                 }
                 idx_min = 0;
                 low = get_u32(pc + 0 * 8);
@@ -4022,10 +4014,25 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     }
 }
 
+static const uint8_t *lre_memchr_ascii_icase(const uint8_t *p, uint32_t c,
+                                              size_t len)
+{
+    const uint8_t *p1, *p2;
+
+    p1 = memchr(p, c, len);
+    if (c < 'A' || c > 'Z')
+        return p1;
+    p2 = memchr(p, c + ('a' - 'A'), len);
+    if (!p1 || (p2 && p2 < p1))
+        return p2;
+    return p1;
+}
+
 static const uint8_t *lre_find_leading_char_candidate(REExecContext *s,
                                                        const uint8_t *cptr,
                                                        const uint32_t *chars,
                                                        int char_count,
+                                                       BOOL ignore_case,
                                                        int *pret)
 {
     int i;
@@ -4041,6 +4048,8 @@ static const uint8_t *lre_find_leading_char_candidate(REExecContext *s,
             if (p >= s->cbuf_end)
                 break;
             GET_CHAR(c, p, s->cbuf_end, s->cbuf_type);
+            if (ignore_case)
+                c = lre_canonicalize_fast(c, FALSE);
             if (c != chars[i])
                 break;
         }
@@ -4061,11 +4070,19 @@ static const uint8_t *lre_find_leading_char_candidate(REExecContext *s,
             chunk_end = search + min_int(candidate_count,
                                          LRE_SCAN_CHUNK_SIZE);
             while (search < chunk_end) {
-                p = memchr(search, chars[0], chunk_end - search);
+                if (ignore_case) {
+                    p = lre_memchr_ascii_icase(search, chars[0],
+                                              chunk_end - search);
+                } else {
+                    p = memchr(search, chars[0], chunk_end - search);
+                }
                 if (!p)
                     break;
                 for(i = 1; i < char_count; i++) {
-                    if (p[i] != chars[i])
+                    uint32_t c = p[i];
+                    if (ignore_case)
+                        c = lre_canonicalize_fast(c, FALSE);
+                    if (c != chars[i])
                         break;
                 }
                 if (i == char_count)
@@ -4091,7 +4108,10 @@ static const uint8_t *lre_find_leading_char_candidate(REExecContext *s,
             chunk_end = p + min_int(candidate_count, LRE_SCAN_CHUNK_SIZE);
             while (p < chunk_end) {
                 for(i = 0; i < char_count; i++) {
-                    if (p[i] != chars[i])
+                    uint32_t c = p[i];
+                    if (ignore_case)
+                        c = lre_canonicalize_fast(c, FALSE);
+                    if (c != chars[i])
                         break;
                 }
                 if (i == char_count)
@@ -4182,7 +4202,10 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
     for(;;) {
         if (filter_candidates) {
             cptr = lre_find_leading_char_candidate(s, cptr, filter_chars,
-                                                    filter_char_count, &ret);
+                                                    filter_char_count,
+                                                    (re_flags &
+                                                     LRE_FLAG_IGNORECASE) != 0,
+                                                    &ret);
             if (!cptr)
                 break;
         }
@@ -4438,12 +4461,12 @@ int lre_validate_bytecode(const uint8_t *bc_buf, size_t bc_buf_len,
         literal_encoding = 0;
         for(metadata_index = 0; metadata_index < literal_length;
             metadata_index++) {
-            if (code[pos] == REOP_char) {
-                c = get_u16(code + pos + 1);
-                pos += 3;
-            } else {
-                c = get_u32(code + pos + 1);
-                pos += 5;
+            if (!re_read_char_opcode(code, code_len, &pos,
+                                     (flags & LRE_FLAG_IGNORECASE) != 0,
+                                     &c)) {
+                return lre_validation_error(
+                    error_msg, error_msg_size,
+                    "regexp metadata character stream is inconsistent");
             }
             if (c > 0xff)
                 literal_encoding = 1;

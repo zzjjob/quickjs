@@ -29,6 +29,7 @@
 
 #include "cutils.h"
 #include "libregexp.h"
+#include "libunicode.h"
 
 typedef enum {
 #define DEF(id, size) TEST_REOP_ ## id,
@@ -160,6 +161,9 @@ static void test_valid_bytecode(void)
         { "(ab)\\1", 0 },
         { "(?<word>ab)+", LRE_FLAG_INDICES },
         { "[^a-z]", LRE_FLAG_UNICODE },
+        { "abcdef[0-9]+", LRE_FLAG_IGNORECASE },
+        { "[a-z]bcdef", LRE_FLAG_IGNORECASE },
+        { "(^|x)abc", LRE_FLAG_IGNORECASE },
     };
     size_t i;
 
@@ -402,6 +406,28 @@ static void test_prefix_metadata(void)
     assert(memcmp(meta.payload, "abc", 3) == 0);
     free(buf);
 
+    buf = compile_regexp("abcdef[0-9]+", LRE_FLAG_IGNORECASE, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_PREFIX && meta.encoding == 0);
+    assert(meta.flags == 0 && meta.length == 6);
+    assert(memcmp(meta.payload, "ABCDEF", 6) == 0);
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    copy[meta_pos + TEST_RE_META_HEADER_LEN] = 'Z';
+    expect_invalid(copy, len);
+    free(copy);
+    free(buf);
+
+    buf = compile_regexp("abcdef[0-9]+",
+                         LRE_FLAG_IGNORECASE | LRE_FLAG_UNICODE, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE &&
+           meta.exec_flags == LRE_META_EXEC_SCAN);
+    free(buf);
+
     buf = compile_regexp("abcdefghijklmnopqrstuvwxyzABCDEF[0-9]+", 0,
                          &len);
     expect_valid(buf, len);
@@ -492,6 +518,23 @@ static void test_quick_check_metadata(void)
     assert(meta.kind == LRE_META_NONE &&
            meta.exec_flags == LRE_META_EXEC_SCAN);
     free(buf);
+
+    buf = compile_regexp("[a-z]bcdef", LRE_FLAG_IGNORECASE, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_QUICK_CHECK && meta.length == 4);
+    record = meta.payload + LRE_QUICK_CHECK_RECORD_SIZE;
+    assert(get_u16(record + LRE_QUICK_CHECK_OFFSET) == 1);
+    assert(get_u16(record + LRE_QUICK_CHECK_VALUE) == 'B');
+    assert(get_u16(record + LRE_QUICK_CHECK_MASK) == 0xffff);
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    put_u16(copy + meta_pos + TEST_RE_META_HEADER_LEN +
+            LRE_QUICK_CHECK_RECORD_SIZE + LRE_QUICK_CHECK_VALUE, 'Z');
+    expect_invalid(copy, len);
+    free(copy);
+    free(buf);
 }
 
 static void test_execution_descriptor(void)
@@ -531,28 +574,54 @@ static void test_execution_descriptor(void)
     expect_invalid(copy, len);
     free(copy);
     free(buf);
+
+    buf = compile_regexp("(^|x)abc", LRE_FLAG_IGNORECASE, &len);
+    expect_valid(buf, len);
+    assert(lre_get_metadata(buf, len, &meta) == 1);
+    assert(meta.kind == LRE_META_NONE);
+    assert(meta.exec_flags ==
+           (LRE_META_EXEC_SCAN | LRE_META_EXEC_LEADING));
+    assert(meta.leading_count == 3);
+    assert(get_u32(meta.leading_chars) == 'A');
+    assert(get_u32(meta.leading_chars + 4) == 'B');
+    assert(get_u32(meta.leading_chars + 8) == 'C');
+    meta_pos = TEST_RE_HEADER_LEN +
+        get_u32(buf + TEST_RE_HEADER_BYTECODE_LEN);
+    copy = dup_bytecode(buf, len);
+    put_u32(copy + meta_pos + TEST_RE_META_HEADER_LEN, 'Z');
+    expect_invalid(copy, len);
+    free(copy);
+    free(buf);
 }
 
 static void test_descriptor_generic_differential(void)
 {
-    static const char * const patterns[] = {
-        "a.c",
-        "(^|[^\\\\])\"x\"",
-        "(a|ab)+c",
-        "(?=(ab+))ab+c",
-        "[a-z]bcdef",
-        "abcdef[0-9]+",
+    static const struct {
+        const char *pattern;
+        int flags;
+    } cases[] = {
+        { "a.c", 0 },
+        { "(^|[^\\\\])\"x\"", 0 },
+        { "(a|ab)+c", 0 },
+        { "(?=(ab+))ab+c", 0 },
+        { "[a-z]bcdef", 0 },
+        { "abcdef[0-9]+", 0 },
+        { "abcdef[0-9]+", LRE_FLAG_IGNORECASE },
+        { "[a-z]bcdef", LRE_FLAG_IGNORECASE },
+        { "(^|x)abc", LRE_FLAG_IGNORECASE },
+        { "(abc)\\1", LRE_FLAG_IGNORECASE },
     };
     uint32_t state = 0x5eed1234;
     char subject[65];
     size_t case_index, i, j;
 
-    for(case_index = 0; case_index < countof(patterns); case_index++) {
+    for(case_index = 0; case_index < countof(cases); case_index++) {
         uint8_t *buf, *generic;
         uint8_t **capture, **generic_capture;
         int alloc_count, capture_count, len;
 
-        buf = compile_regexp(patterns[case_index], 0, &len);
+        buf = compile_regexp(cases[case_index].pattern,
+                             cases[case_index].flags, &len);
         generic = dup_bytecode(buf, len);
         put_u16(generic + TEST_RE_HEADER_FLAGS,
                 get_u16(generic + TEST_RE_HEADER_FLAGS) &
@@ -569,7 +638,7 @@ static void test_descriptor_generic_differential(void)
 
             for(j = 0; j < sizeof(subject) - 1; j++) {
                 state = state * 1664525 + 1013904223;
-                subject[j] = "abcxyz0\\\""[state % 9];
+                subject[j] = "abcABCxyzXYZ0\\\""[state % 15];
             }
             subject[sizeof(subject) - 1] = '\0';
             ret = lre_exec(capture, buf, (const uint8_t *)subject, 0,
@@ -614,8 +683,21 @@ static void test_arbitrary_bytecode(void)
     }
 }
 
+static void test_canonicalize_fast(void)
+{
+    uint32_t c;
+
+    for(c = 0; c < 0x110000; c++) {
+        assert(lre_canonicalize_fast(c, FALSE) ==
+               (uint32_t)lre_canonicalize(c, FALSE));
+        assert(lre_canonicalize_fast(c, TRUE) ==
+               (uint32_t)lre_canonicalize(c, TRUE));
+    }
+}
+
 int main(void)
 {
+    test_canonicalize_fast();
     test_valid_bytecode();
     test_header_validation();
     test_instruction_validation();

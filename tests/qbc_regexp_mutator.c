@@ -154,7 +154,7 @@ static void mutate_function_opcode(uint8_t *payload, size_t payload_len)
 }
 
 static void mutate_regexp(uint8_t *payload, size_t payload_len,
-                          const char *pattern, const char *mode)
+                          const char *pattern, int flags, const char *mode)
 {
     uint8_t *compiled, *target;
     uint8_t *metadata;
@@ -162,7 +162,7 @@ static void mutate_regexp(uint8_t *payload, size_t payload_len,
     char error[128];
 
     compiled = lre_compile(&compiled_len, error, sizeof(error), pattern,
-                           strlen(pattern), 0, NULL);
+                           strlen(pattern), flags, NULL);
     if (!compiled)
         die(error);
     target = find_unique(payload, payload_len, compiled, compiled_len);
@@ -180,14 +180,18 @@ static void mutate_regexp(uint8_t *payload, size_t payload_len,
     } else if (!strcmp(mode, "bad-scan-entry")) {
         put_u32(metadata + LRE_META_ENTRY_OFFSET,
                 get_u32(metadata + LRE_META_ENTRY_OFFSET) + 1);
-    } else if (!strcmp(mode, "bad-leading-char")) {
+    } else if (!strcmp(mode, "bad-leading-char") ||
+               !strcmp(mode, "bad-icase-leading-char")) {
         put_u32(metadata + LRE_META_HEADER_LEN,
                 get_u32(metadata + LRE_META_HEADER_LEN) + 1);
     } else if (!strcmp(mode, "bad-prefix-entry")) {
         put_u32(metadata + LRE_META_ENTRY_OFFSET,
                 get_u32(metadata + LRE_META_ENTRY_OFFSET) + 1);
-    } else if (!strcmp(mode, "bad-quick-check")) {
+    } else if (!strcmp(mode, "bad-quick-check") ||
+               !strcmp(mode, "bad-icase-quick-check")) {
         put_u16(metadata + LRE_META_HEADER_LEN + LRE_QUICK_CHECK_MASK, 0);
+    } else if (!strcmp(mode, "bad-icase-prefix")) {
+        metadata[LRE_META_HEADER_LEN]++;
     } else {
         free(compiled);
         die("unknown regexp mutation");
@@ -224,28 +228,37 @@ int main(int argc, char **argv)
     }
 
     if (!strcmp(mode, "forge-atom-capture")) {
-        mutate_regexp(payload, payload_len, "(abc)", "forge-atom");
+        mutate_regexp(payload, payload_len, "(abc)", 0, "forge-atom");
     } else if (!strcmp(mode, "forge-atom-nonliteral")) {
-        mutate_regexp(payload, payload_len, "a.c", "forge-atom");
+        mutate_regexp(payload, payload_len, "a.c", 0, "forge-atom");
     } else if (!strcmp(mode, "clear-atom")) {
-        mutate_regexp(payload, payload_len, "abc", mode);
+        mutate_regexp(payload, payload_len, "abc", 0, mode);
     } else if (!strcmp(mode, "clear-atom-escaped")) {
         mutate_regexp(payload, payload_len, "\\x74he quick brown fox",
-                      "clear-atom");
+                      0, "clear-atom");
     } else if (!strcmp(mode, "bad-regexp-opcode")) {
-        mutate_regexp(payload, payload_len, "abc", mode);
+        mutate_regexp(payload, payload_len, "abc", 0, mode);
     } else if (!strcmp(mode, "bad-metadata-version")) {
-        mutate_regexp(payload, payload_len, "abc", mode);
+        mutate_regexp(payload, payload_len, "abc", 0, mode);
     } else if (!strcmp(mode, "bad-source-payload")) {
-        mutate_regexp(payload, payload_len, "\\x61bc", mode);
+        mutate_regexp(payload, payload_len, "\\x61bc", 0, mode);
     } else if (!strcmp(mode, "bad-scan-entry")) {
-        mutate_regexp(payload, payload_len, "a.c", mode);
+        mutate_regexp(payload, payload_len, "a.c", 0, mode);
     } else if (!strcmp(mode, "bad-leading-char")) {
-        mutate_regexp(payload, payload_len, "(^|[^\\\\])\"x\"", mode);
+        mutate_regexp(payload, payload_len, "(^|[^\\\\])\"x\"", 0, mode);
     } else if (!strcmp(mode, "bad-prefix-entry")) {
-        mutate_regexp(payload, payload_len, "abcdef[0-9]+", mode);
+        mutate_regexp(payload, payload_len, "abcdef[0-9]+", 0, mode);
     } else if (!strcmp(mode, "bad-quick-check")) {
-        mutate_regexp(payload, payload_len, "[a-z]bcdef", mode);
+        mutate_regexp(payload, payload_len, "[a-z]bcdef", 0, mode);
+    } else if (!strcmp(mode, "bad-icase-prefix")) {
+        mutate_regexp(payload, payload_len, "abcdef[0-9]+",
+                      LRE_FLAG_IGNORECASE, mode);
+    } else if (!strcmp(mode, "bad-icase-quick-check")) {
+        mutate_regexp(payload, payload_len, "[a-z]bcdef",
+                      LRE_FLAG_IGNORECASE, mode);
+    } else if (!strcmp(mode, "bad-icase-leading-char")) {
+        mutate_regexp(payload, payload_len, "(^|x)abc",
+                      LRE_FLAG_IGNORECASE, mode);
     } else if (!strcmp(mode, "bad-function-opcode")) {
         mutate_function_opcode(payload, payload_len);
     } else {
